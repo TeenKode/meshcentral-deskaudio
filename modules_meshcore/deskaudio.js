@@ -4,7 +4,10 @@
  *
  *  Linux:   helpers/linux-capture.sh   (parec from PulseAudio/PipeWire, run as the logged-in user)
  *  Windows: helpers/deskaudio-x64.exe / deskaudio-x86.exe  (prebuilt native WASAPI loopback,
- *           no .NET needed), with helpers/win-loopback.cs compiled by csc.exe as a fallback.
+ *           no .NET needed).
+ *
+ * Every capture carries the server's session id (`sid`); the agent echoes it in
+ * every status and chunk so the server can ignore messages from an earlier one.
  */
 var PLUGIN = 'deskaudio';
 var SPAWN_AS_USER = false;   // Windows: set true to launch the helper inside the logged-in user's session
@@ -15,9 +18,13 @@ var child = null;
 var curRate = 16000;
 var curCompress = true;   // ADPCM on by default; false = raw PCM (higher quality, more traffic)
 var curSilence = true;    // suppress pure digital silence; false = always send
+var curSid = null;        // server session id of the current capture
+var pending = null;       // consent prompt waiting for the local user
 var errBuf = '';
 var lastKeep = 0;
 var watchdog = null;
+
+var PROTO = 2;            // 2 = understands sid and consent
 
 function send(o) {
     o.action = 'plugin';
@@ -25,7 +32,9 @@ function send(o) {
     try { ((mesh && mesh.SendCommand) ? mesh : require('MeshAgent')).SendCommand(o); } catch (e) { }
 }
 
-function fail(msg) { send({ pluginaction: 'status', state: 'error', msg: String(msg) }); }
+function fail(msg, code, sid) {
+    send({ pluginaction: 'status', sid: (sid === undefined) ? curSid : sid, state: 'error', code: code || 'helper_failed', msg: String(msg) });
+}
 
 // True only if a buffer of s16le PCM is pure digital silence, so the agent can
 // skip streaming it while nothing plays (Windows WASAPI fills silence with exact
@@ -108,7 +117,9 @@ function startWatch() {
 function stopWatch() { if (watchdog != null) { clearInterval(watchdog); watchdog = null; } }
 
 function run(path, args) {
-    var c = spawn(path, args);
+    var sid = curSid;
+    var c;
+    try { c = spawn(path, args); } catch (e) { return fail('Не удалось запустить хелпер: ' + e); }
     child = c;
     c.stderr.on('data', function (x) {
         errBuf += x.toString();
@@ -117,24 +128,26 @@ function run(path, args) {
     c.stdout.on('data', function (x) {
         if (child !== c) return;
         if (curSilence && isSilent(x)) return;   // don't stream pure silence
-        if (curCompress) send({ pluginaction: 'chunk', rate: curRate, codec: 'adpcm', d: adpcmEncode(x).toString('base64') });
-        else send({ pluginaction: 'chunk', rate: curRate, d: x.toString('base64') });
+        if (curCompress) send({ pluginaction: 'chunk', sid: sid, rate: curRate, codec: 'adpcm', d: adpcmEncode(x).toString('base64') });
+        else send({ pluginaction: 'chunk', sid: sid, rate: curRate, d: x.toString('base64') });
     });
     c.on('exit', function (code) {
         if (child !== c) return;
         child = null;
         stopWatch();
-        send({ pluginaction: 'status', state: (code == 0 ? 'stopped' : 'error'), code: code, msg: errBuf });
+        send({ pluginaction: 'status', sid: sid, state: (code == 0 ? 'stopped' : 'error'), code: (code == 0 ? 'helper_exit' : 'helper_failed'), exitcode: code, msg: errBuf });
     });
-    send({ pluginaction: 'status', state: 'started', rate: curRate });
+    send({ pluginaction: 'status', sid: sid, state: 'started', proto: PROTO, rate: curRate });
     startWatch();
 }
 
+// The script is passed inline (sh -c) rather than written to a file: a fixed
+// path in world-writable /tmp could be pre-created or swapped by a local user and
+// then executed as root.
 function startLinux(a) {
-    var fs = require('fs');
-    var p = '/tmp/.deskaudio-capture.sh';
-    try { fs.writeFileSync(p, Buffer.from(a.script, 'base64')); } catch (e) { return fail('Не удалось записать скрипт: ' + e); }
-    run('/bin/sh', ['sh', p, String(curRate)]);
+    if (!a.script) return fail('Нет скрипта захвата для Linux');
+    var script = Buffer.from(a.script, 'base64').toString();
+    run('/bin/sh', ['sh', '-c', script, 'deskaudio', String(curRate)]);
 }
 
 // Directory of the running MeshAgent (e.g. C:\Program Files\Mesh Agent). This
@@ -152,122 +165,135 @@ function agentDir() {
     return null;
 }
 
-// Candidate directories for the helper, most-excluded first: the agent folder,
-// then %TEMP% as a fallback if that folder is not writable.
-function winHelperDirs() {
-    var tmp = process.env['TEMP'] || process.env['TMP'] || ((process.env['windir'] || 'C:\\Windows') + '\\Temp');
-    var dirs = [];
-    var ad = agentDir();
-    if (ad) dirs.push(ad);
-    dirs.push(tmp);
-    return dirs;
+function sameBytes(x, y) {
+    if (!x || !y || x.length !== y.length) return false;
+    for (var i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    return true;
 }
 
-// Write `data` to <dir>\<name> under a fixed name so the path is stable across
-// plugin versions. A sidecar "<name>.ver" records the content version; the file
-// is rewritten only when that version changes. Returns the path or null.
-function dropFile(fs, dir, name, ver, data) {
+// Write `data` to <dir>\<name> unless the file already holds exactly these
+// bytes. The existing file is compared byte for byte (never trusted by name or a
+// version sidecar), so a planted or stale file is always replaced. Returns the
+// path, or null if the file could not be written (e.g. it is still running).
+function dropFile(fs, dir, name, data) {
+    var p = dir + '\\' + name;
     try {
-        var p = dir + '\\' + name;
-        var vp = p + '.ver';
         var cur = null;
-        try { cur = fs.readFileSync(vp).toString(); } catch (e) { }
-        if (cur !== ver || !fs.existsSync(p)) {
-            fs.writeFileSync(p, data);
-            try { fs.writeFileSync(vp, Buffer.from(ver)); } catch (e) { }
-        }
-        return fs.existsSync(p) ? p : null;
+        try { cur = fs.readFileSync(p); } catch (e) { }
+        if (sameBytes(cur, data)) return p;
+        fs.writeFileSync(p, data);
+        return sameBytes(fs.readFileSync(p), data) ? p : null;
     } catch (e) { return null; }
 }
 
+// The helper runs only from the agent's own folder (writable by administrators
+// only, and normally already excluded by antivirus). There is deliberately no
+// fallback to %TEMP%: C:\Windows\Temp is writable by ordinary users.
 function startWin(a) {
     var fs = require('fs');
-    var hdirs = winHelperDirs();
+    var dir = agentDir();
+    if (!dir) return fail('Не удалось определить папку агента', 'helper_failed');
 
-    // 1) Preferred: a prebuilt native helper — no .NET or compiler on the target.
-    //    Use the 64-bit build on a 64-bit OS, the 32-bit build otherwise; the
-    //    32-bit build also runs on 64-bit Windows (WOW64) as a safe default.
-    var os64 = (process.env['PROCESSOR_ARCHITECTURE'] == 'AMD64' ||
-                process.env['PROCESSOR_ARCHITECTURE'] == 'ARM64' ||
-                process.env['PROCESSOR_ARCHITEW6432'] != null);
-    var exeB64 = os64 ? a.exe64 : a.exe32;
-    var exeVer = os64 ? a.ver64 : a.ver32;
-    if (!exeB64) { exeB64 = a.exe32; exeVer = a.ver32; }
-    if (exeB64 && exeVer) {
-        var data = Buffer.from(exeB64, 'base64');
-        for (var i = 0; i < hdirs.length; i++) {
-            var p = dropFile(fs, hdirs[i], 'deskaudio-helper.exe', exeVer, data);
-            if (p) return run(p, ['deskaudio.exe', String(curRate)]);
-        }
+    // 64-bit build on x64 Windows; the 32-bit build everywhere else. On ARM64
+    // the x86 build runs under emulation on both Windows 10 and 11 (x64
+    // emulation exists only on Windows 11).
+    var arch = process.env['PROCESSOR_ARCHITEW6432'] || process.env['PROCESSOR_ARCHITECTURE'];
+    var exeB64 = (arch == 'AMD64') ? a.exe64 : a.exe32;
+    if (!exeB64) exeB64 = a.exe32;
+    if (!exeB64) return fail('Нет хелпера для Windows', 'no_helpers');
+    var data = Buffer.from(exeB64, 'base64');
+    // A second name is used if the first is locked (e.g. a previous capture is
+    // still exiting while a new helper version is dropped).
+    var names = ['deskaudio-helper.exe', 'deskaudio-helper-b.exe'];
+    for (var i = 0; i < names.length; i++) {
+        var p = dropFile(fs, dir, names[i], data);
+        if (p) return run(p, ['deskaudio.exe', String(curRate)]);
     }
+    fail('Не удалось записать хелпер в папку агента: ' + dir, 'helper_write');
+}
 
-    // 2) Fallback: compile the C# helper with any csc.exe from the .NET Framework.
-    if (!a.source || !a.ver) return fail('Нет хелпера для Windows');
-    var dir = hdirs[0];
-    var exe = dir + '\\deskaudio-helper-cs.exe';
-    if (fs.existsSync(exe)) return run(exe, ['deskaudio.exe', String(curRate)]);
+// Ask the local user for consent. Resolves `cb(true)` on "yes", `cb(false)` on
+// "no" or timeout. Uses MeshAgent's own message-box module, as the desktop does.
+function askConsent(c, cb) {
+    var pr;
+    try { pr = require('message-box').create(c.title || 'MeshCentral', c.msg, c.timeout || 30); }
+    catch (e) { cb(c.autoAcceptNoUser === true); return null; }   // no interactive session to ask
+    pr.then(function () { cb(true); }, function () { cb(false); });
+    return pr;
+}
 
-    var src = dir + '\\deskaudio-helper.cs';
-    try { fs.writeFileSync(src, Buffer.from(a.source, 'base64')); } catch (e) { return fail('Не удалось записать исходник: ' + e); }
-    // Find any csc.exe shipped with the .NET Framework. Try newest first (v4 on
-    // Win8/10/11), then fall back to v3.5 / v2.0 which are built into Windows 7
-    // by default. Each machine compiles with its own compiler and runs the result
-    // on the matching CLR, so no single version has to be present everywhere.
-    var win = process.env['windir'] || 'C:\\Windows';
-    var vers = ['v4.0.30319', 'v3.5', 'v2.0.50727'];
-    var fdirs = ['Framework64', 'Framework'];
-    var csc = null;
-    for (var vi = 0; vi < vers.length && !csc; vi++) {
-        for (var di = 0; di < fdirs.length; di++) {
-            var cand = win + '\\Microsoft.NET\\' + fdirs[di] + '\\' + vers[vi] + '\\csc.exe';
-            if (fs.existsSync(cand)) { csc = cand; break; }
-        }
-    }
-    if (!csc) return fail('Не найден csc.exe (.NET Framework 2.0/3.5/4)');
+function notifyUser(c) {
+    try { require('toaster').Toast(c.title || 'MeshCentral', c.notifyMsg); } catch (e) { }
+}
 
-    var out = '';
-    var c = require('child_process').execFile(csc, ['csc.exe', '/nologo', '/optimize+', '/out:' + exe, src]);
-    c.stdout.on('data', function (x) { out += x.toString(); });
-    c.stderr.on('data', function (x) { out += x.toString(); });
-    c.on('exit', function () {
-        if (fs.existsSync(exe)) run(exe, ['deskaudio.exe', String(curRate)]);
-        else fail('Не удалось собрать хелпер: ' + out.substring(0, 400));
-    });
+function begin(a) {
+    if (process.platform == 'linux') return startLinux(a);
+    if (process.platform == 'win32') return startWin(a);
+    fail('Платформа не поддерживается: ' + process.platform, 'unsupported');
 }
 
 function startCapture(a) {
     stopCapture(true);
+    curSid = (typeof a.sid == 'number') ? a.sid : null;
     curRate = (a.rate == 8000 || a.rate == 16000 || a.rate == 24000) ? a.rate : 16000;
     curCompress = (a.compress !== false);
     curSilence = (a.silence !== false);
     errBuf = '';
     lastKeep = Date.now();
-    if (process.platform == 'linux') return startLinux(a);
-    if (process.platform == 'win32') return startWin(a);
-    fail('Платформа не поддерживается: ' + process.platform);
+    var c = a.consent || {};
+    if (!c.prompt) {
+        begin(a);
+        if (c.notify) notifyUser(c);
+        return;
+    }
+    var sid = curSid;
+    send({ pluginaction: 'status', sid: sid, state: 'waiting', code: 'consent_wait', timeout: c.timeout || 30 });
+    pending = askConsent(c, function (ok) {
+        pending = null;
+        if (curSid !== sid) return;                 // stopped or restarted meanwhile
+        if (!ok) return send({ pluginaction: 'status', sid: sid, state: 'error', code: 'consent_denied', msg: 'Пользователь не разрешил прослушивание' });
+        lastKeep = Date.now();
+        begin(a);
+        if (c.notify) notifyUser(c);
+    });
 }
 
 function stopCapture(silent) {
     stopWatch();
-    var c = child;
+    if (pending) { try { if (pending.close) pending.close(); } catch (e) { } pending = null; }
+    var c = child, sid = curSid;
     child = null;
+    curSid = null;
     if (c) {
         try { c.kill(); } catch (e) { }
         if (process.platform == 'linux') {
             // the shell wrapper may leave parec behind
             try { require('child_process').execFile('/usr/bin/pkill', ['pkill', '-f', 'client-name=deskaudio']); } catch (e) { }
         }
-        if (!silent) send({ pluginaction: 'status', state: 'stopped' });
+        if (!silent) send({ pluginaction: 'status', sid: sid, state: 'stopped', code: 'stopped' });
     }
 }
+
+// A stop (or keepalive) for a specific capture only applies to that capture.
+function forCurrent(args) { return (typeof args.sid != 'number') || args.sid === curSid; }
 
 function consoleaction(args, rights, sessionid, parent) {
     if (parent && parent.SendCommand) mesh = parent;
     switch (args.pluginaction) {
         case 'start': startCapture(args); break;
-        case 'stop': stopCapture(false); break;
-        case 'keepalive': lastKeep = Date.now(); break;
+        case 'stop': if (forCurrent(args)) stopCapture(false); break;
+        case 'keepalive': if (forCurrent(args)) lastKeep = Date.now(); break;
+        case 'consent':
+            // A further listener joins a running capture: ask the user again.
+            if (!forCurrent(args) || !args.consent) break;
+            var reqid = args.reqid, sid = curSid;
+            askConsent(args.consent, function (ok) {
+                send({ pluginaction: 'consentresult', sid: sid, reqid: reqid, ok: !!ok });
+                if (ok && args.consent.notify) notifyUser(args.consent);
+            });
+            break;
+        case 'notify': if (forCurrent(args) && args.consent) notifyUser(args.consent); break;
     }
 }
 
-module.exports = { consoleaction: consoleaction, _isSilent: isSilent, _adpcmEncode: adpcmEncode };
+module.exports = { consoleaction: consoleaction, _isSilent: isSilent, _adpcmEncode: adpcmEncode, _dropFile: dropFile };

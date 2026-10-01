@@ -21,10 +21,24 @@ module.exports.deskaudio = function (parent) {
     var crypto = require('crypto');
 
     var MESHRIGHT_REMOTECONTROL = 0x00000008;
+    var MESHRIGHT_NODESKTOP = 0x00010000;
+    var USERCONSENT_DesktopNotifyUser = 1;
+    var USERCONSENT_DesktopPromptUser = 8;
     var MAX_LISTENERS_PER_NODE = 10;
     var MAX_TOTAL_STREAMS = 50;   // server-wide cap on simultaneously captured devices
     var KEEPALIVE_MS = 15000;
-    var listeners = {};          // nodeid -> [user session objects]
+    var DEFAULT_CONSENT_MSG = 'Пользователь {0} запрашивает прослушивание звука этого компьютера. Разрешить?';
+    var DEFAULT_NOTIFY_MSG = 'Пользователь {0} слушает звук этого компьютера.';
+
+    // nodeid -> stream: { sid, listeners: [sess], users: {userid: true}, pending: {reqid: sess},
+    //                     consent, ready, rate }
+    // `sid` identifies one capture on the agent. The agent echoes it in every
+    // status and chunk, so messages from an earlier capture (e.g. the "stopped"
+    // of a stop that raced a new start) can never end or feed a newer one.
+    var streams = {};
+    var nextSid = 1;
+    var nextReq = 1;
+    var sessState = new WeakMap();   // user session -> { hooked, gen: {nodeid: n} }
     var keepTimer = null;
     var helperCache = null;
 
@@ -35,7 +49,6 @@ module.exports.deskaudio = function (parent) {
 
     function loadHelpers() {
         if (helperCache) return helperCache;
-        var src = fs.readFileSync(path.join(__dirname, 'helpers', 'win-loopback.cs'));
         var sh = fs.readFileSync(path.join(__dirname, 'helpers', 'linux-capture.sh'));
         var exe64 = fs.readFileSync(path.join(__dirname, 'helpers', 'deskaudio-x64.exe'));
         var exe32 = fs.readFileSync(path.join(__dirname, 'helpers', 'deskaudio-x86.exe'));
@@ -44,10 +57,7 @@ module.exports.deskaudio = function (parent) {
             // Windows: prebuilt native helpers (no .NET required). 32-bit build runs
             // on 32- and 64-bit Windows; 64-bit build runs natively on x64.
             exe64: exe64.toString('base64'), ver64: md5(exe64),
-            exe32: exe32.toString('base64'), ver32: md5(exe32),
-            // Fallback if the prebuilt exe can't be dropped: compile the C# helper on
-            // the machine with any csc.exe that ships with the .NET Framework.
-            source: src.toString('base64'), ver: md5(src)
+            exe32: exe32.toString('base64'), ver32: md5(exe32)
         };
         return helperCache;
     }
@@ -143,6 +153,14 @@ module.exports.deskaudio = function (parent) {
         } catch (e) { }
     }
 
+    // Status to one browser. `code` is a stable identifier the browser can
+    // translate; `msg` is the Russian fallback text.
+    function sendStatus(sess, nodeid, state, code, msg, extra) {
+        var m = { method: 'onStatus', nodeid: nodeid, state: state, code: code || '', msg: msg || '' };
+        if (extra) for (var k in extra) m[k] = extra[k];
+        sendUser(sess, m);
+    }
+
     function logEvent(sess, node, text) {
         try {
             obj.meshServer.DispatchEvent(['*', node.meshid, node._id], obj, {
@@ -153,114 +171,207 @@ module.exports.deskaudio = function (parent) {
         } catch (e) { }
     }
 
+    function stateOf(sess) {
+        var s = sessState.get(sess);
+        if (!s) { s = { hooked: false, gen: {} }; sessState.set(sess, s); }
+        return s;
+    }
+
     function ensureKeepalive() {
         if (keepTimer) return;
         keepTimer = setInterval(function () {
-            var ids = Object.keys(listeners);
+            var ids = Object.keys(streams);
             if (ids.length === 0) { clearInterval(keepTimer); keepTimer = null; return; }
             ids.forEach(function (nodeid) {
                 var agent = agentOf(nodeid);
-                if (!agent) { endStream(nodeid, 'stopped', 'Агент отключился'); return; }
-                sendAgent(agent, { pluginaction: 'keepalive' });
+                if (!agent) { endStream(nodeid, 'stopped', 'agent_offline', 'Агент отключился'); return; }
+                sendAgent(agent, { pluginaction: 'keepalive', sid: streams[nodeid].sid });
             });
         }, KEEPALIVE_MS);
         if (keepTimer.unref) keepTimer.unref();
     }
 
-    function endStream(nodeid, state, msg) {
-        var list = listeners[nodeid];
-        delete listeners[nodeid];
-        if (list) list.forEach(function (s) { sendUser(s, { method: 'onStatus', nodeid: nodeid, state: state, msg: msg || '' }); });
+    function endStream(nodeid, state, code, msg) {
+        var st = streams[nodeid];
+        delete streams[nodeid];
+        if (!st) return;
+        st.listeners.forEach(function (s) { sendStatus(s, nodeid, state, code, msg); });
+        Object.keys(st.pending).forEach(function (r) { sendStatus(st.pending[r], nodeid, state, code, msg); });
     }
 
     function removeListener(nodeid, sess) {
-        var list = listeners[nodeid];
-        if (!list) return;
-        list = list.filter(function (s) { return s !== sess; });
-        if (list.length > 0) { listeners[nodeid] = list; return; }
-        delete listeners[nodeid];
+        var st = streams[nodeid];
+        if (!st) return;
+        st.listeners = st.listeners.filter(function (s) { return s !== sess; });
+        Object.keys(st.pending).forEach(function (r) { if (st.pending[r] === sess) delete st.pending[r]; });
+        if (st.listeners.length > 0 || Object.keys(st.pending).length > 0) return;
+        delete streams[nodeid];
         var agent = agentOf(nodeid);
-        if (agent) sendAgent(agent, { pluginaction: 'stop' });
+        if (agent) sendAgent(agent, { pluginaction: 'stop', sid: st.sid });
     }
 
     function removeSession(sess) {
-        Object.keys(listeners).forEach(function (nodeid) { removeListener(nodeid, sess); });
+        Object.keys(streams).forEach(function (nodeid) { removeListener(nodeid, sess); });
+    }
+
+    // Effective user-consent flags for the desktop, combined exactly like
+    // MeshCentral's relay does: server-wide | device group | device | user.
+    function consentFlags(web, domain, node, user) {
+        var c = 0;
+        if (domain && typeof domain.userconsentflags === 'number') c |= domain.userconsentflags;
+        var mesh = (web && web.meshes) ? web.meshes[node.meshid] : null;
+        if (mesh && typeof mesh.consent === 'number') c |= mesh.consent;
+        if (typeof node.consent === 'number') c |= node.consent;
+        if (user && typeof user.consent === 'number') c |= user.consent;
+        return c & (USERCONSENT_DesktopNotifyUser | USERCONSENT_DesktopPromptUser);
+    }
+
+    // What the agent needs to ask (or notify) the local user for one listener.
+    function consentInfo(flags, domain, user) {
+        var cm = (domain && typeof domain.consentmessages === 'object' && domain.consentmessages) || {};
+        var who = user.realname || user.name;
+        return {
+            prompt: (flags & USERCONSENT_DesktopPromptUser) !== 0,
+            notify: (flags & USERCONSENT_DesktopNotifyUser) !== 0,
+            title: (typeof cm.title === 'string') ? cm.title : 'MeshCentral',
+            msg: DEFAULT_CONSENT_MSG.replace(/\{0\}/g, who),
+            notifyMsg: DEFAULT_NOTIFY_MSG.replace(/\{0\}/g, who),
+            timeout: (typeof cm.consenttimeout === 'number' && cm.consenttimeout > 0) ? cm.consenttimeout : 30,
+            autoAcceptNoUser: cm.autoacceptifdesktopnouser === true
+        };
+    }
+
+    function attach(st, sess) {
+        st.listeners.push(sess);
+        st.users[sess.user._id] = true;
     }
 
     // ---------- user (browser) -> server ----------
     function userAction(command, sess, web) {
         var nodeid = command.nodeid;
         if (typeof nodeid !== 'string' || nodeid.indexOf('node/') !== 0) return;
+        var ss = stateOf(sess);
+        // Every start/stop bumps the per-node generation, so a start whose rights
+        // check completes after a later stop (or a newer start) is discarded.
+        var gen = ss.gen[nodeid] = (ss.gen[nodeid] || 0) + 1;
 
         if (command.pluginaction === 'stop') { removeListener(nodeid, sess); return; }
         if (command.pluginaction !== 'start') return;
 
         var domain = sess.domain || obj.meshServer.config.domains[sess.user.domain];
         web.GetNodeWithRights(domain, sess.user, nodeid, function (node, rights) {
-            if (!node || (rights & MESHRIGHT_REMOTECONTROL) === 0)
-                return sendUser(sess, { method: 'onStatus', nodeid: nodeid, state: 'error', msg: 'Нет права «удалённое управление» на это устройство' });
+            if (ss.gen[nodeid] !== gen) return;
+            if (!node || (rights & MESHRIGHT_REMOTECONTROL) === 0 ||
+                (rights !== 0xFFFFFFFF && (rights & MESHRIGHT_NODESKTOP) !== 0))
+                return sendStatus(sess, nodeid, 'error', 'no_rights', 'Нет права «удалённое управление» (рабочий стол) на это устройство');
             var agent = agentOf(nodeid);
-            if (!agent)
-                return sendUser(sess, { method: 'onStatus', nodeid: nodeid, state: 'error', msg: 'Устройство не в сети' });
+            if (!agent) return sendStatus(sess, nodeid, 'error', 'offline', 'Устройство не в сети');
 
-            var list = listeners[nodeid] || [];
-            if (list.indexOf(sess) >= 0) return;
-            if (list.length >= MAX_LISTENERS_PER_NODE)
-                return sendUser(sess, { method: 'onStatus', nodeid: nodeid, state: 'error', msg: 'Слишком много слушателей' });
-            // Server-wide cap: a brand-new capture (no existing listeners for this
-            // node) counts against the total number of simultaneous streams.
-            if (!listeners[nodeid] && Object.keys(listeners).length >= MAX_TOTAL_STREAMS)
-                return sendUser(sess, { method: 'onStatus', nodeid: nodeid, state: 'error', msg: 'Сервер: слишком много одновременных аудиопотоков' });
+            var st = streams[nodeid];
+            if (st && (st.listeners.indexOf(sess) >= 0 || Object.keys(st.pending).some(function (r) { return st.pending[r] === sess; }))) return;
+            if (st && st.listeners.length + Object.keys(st.pending).length >= MAX_LISTENERS_PER_NODE)
+                return sendStatus(sess, nodeid, 'error', 'too_many_listeners', 'Слишком много слушателей');
+            // Server-wide cap: a brand-new capture counts against the total number
+            // of simultaneous streams.
+            if (!st && Object.keys(streams).length >= MAX_TOTAL_STREAMS)
+                return sendStatus(sess, nodeid, 'error', 'too_many_streams', 'Сервер: слишком много одновременных аудиопотоков');
 
-            if (!sess._deskaudioHooked && sess.ws) {
-                sess._deskaudioHooked = true;
+            if (!ss.hooked && sess.ws) {
+                ss.hooked = true;
                 sess.ws.on('close', function () { removeSession(sess); });
             }
-            list.push(sess);
-            listeners[nodeid] = list;
             ensureKeepalive();
             logEvent(sess, node, 'Прослушивание звука рабочего стола: начало');
+            var consent = consentInfo(consentFlags(web, domain, node, sess.user), domain, sess.user);
 
-            if (list.length === 1) {
-                var rate = parseInt(command.rate, 10);
-                if ([8000, 16000, 24000].indexOf(rate) < 0) rate = 16000;
-                var h;
-                try { h = loadHelpers(); } catch (e) { endStream(nodeid, 'error', 'Не найдены файлы helpers/ плагина'); return; }
-                sendAgent(agent, {
-                    pluginaction: 'start', rate: rate,
-                    compress: command.compress !== false, silence: command.silence !== false, script: h.script,
-                    exe64: h.exe64, ver64: h.ver64, exe32: h.exe32, ver32: h.ver32,
-                    source: h.source, ver: h.ver
-                });
-            } else {
-                sendUser(sess, { method: 'onStatus', nodeid: nodeid, state: 'started' });
+            if (st) {
+                // Joining a running capture. If the device requires consent, the
+                // local user is asked again for this new listener.
+                if (consent.prompt && !st.users[sess.user._id]) {
+                    var reqid = nextReq++;
+                    st.pending[reqid] = sess;
+                    sendStatus(sess, nodeid, 'waiting', 'consent_wait', 'Ожидание разрешения пользователя…', { timeout: consent.timeout });
+                    sendAgent(agent, { pluginaction: 'consent', sid: st.sid, reqid: reqid, consent: consent });
+                    return;
+                }
+                attach(st, sess);
+                if (consent.notify) sendAgent(agent, { pluginaction: 'notify', sid: st.sid, consent: consent });
+                return sendStatus(sess, nodeid, 'started', '', '', { rate: st.rate });
             }
+
+            var rate = parseInt(command.rate, 10);
+            if ([8000, 16000, 24000].indexOf(rate) < 0) rate = 16000;
+            var h;
+            try { h = loadHelpers(); } catch (e) { return sendStatus(sess, nodeid, 'error', 'no_helpers', 'Не найдены файлы helpers/ плагина'); }
+            st = streams[nodeid] = {
+                sid: nextSid++, listeners: [], users: {}, pending: {},
+                // With consent required, no audio is relayed until the agent
+                // confirms (in 'started') that it understood the consent request.
+                consent: consent.prompt || consent.notify, ready: false, rate: rate
+            };
+            attach(st, sess);
+            sendAgent(agent, {
+                pluginaction: 'start', sid: st.sid, rate: rate,
+                compress: command.compress !== false, silence: command.silence !== false,
+                consent: consent, script: h.script,
+                exe64: h.exe64, ver64: h.ver64, exe32: h.exe32, ver32: h.ver32
+            });
         });
     }
 
     // ---------- agent -> server ----------
     function agentAction(command, agent) {
         var nodeid = agent.dbNodeKey;   // taken from the authenticated agent, never from the message
-        var list = listeners[nodeid];
-        if (!list) {
+        var st = streams[nodeid];
+        var sid = (typeof command.sid === 'number') ? command.sid : null;
+        if (st && sid !== null && sid !== st.sid) return;   // stale message from an earlier capture
+        if (!st) {
             // No listeners (e.g. the server restarted while the agent was still
             // capturing, or the last listener just left): tell the agent to stop
             // so it does not keep an orphaned capture running.
             if (command.pluginaction === 'chunk' || (command.pluginaction === 'status' && command.state !== 'stopped' && command.state !== 'error')) {
-                sendAgent(agent, { pluginaction: 'stop' });
+                sendAgent(agent, { pluginaction: 'stop', sid: sid });
             }
             return;
         }
         switch (command.pluginaction) {
             case 'chunk':
                 if (typeof command.d !== 'string' || command.d.length > 262144) return;
-                list.forEach(function (s) { sendUser(s, { method: 'onChunk', nodeid: nodeid, rate: command.rate, codec: command.codec, d: command.d }); });
+                if (st.consent && !st.ready) return;
+                var rate = parseInt(command.rate, 10);
+                if ([8000, 16000, 24000].indexOf(rate) < 0) return;
+                var codec = (command.codec === 'adpcm') ? 'adpcm' : undefined;
+                st.listeners.forEach(function (s) { sendUser(s, { method: 'onChunk', nodeid: nodeid, rate: rate, codec: codec, d: command.d }); });
                 break;
             case 'status':
                 var state = String(command.state || '');
+                var code = String(command.code || '').substring(0, 40);
                 var msg = String(command.msg || '').substring(0, 500);
-                if (state === 'stopped' || state === 'error') endStream(nodeid, state, msg);
-                else list.forEach(function (s) { sendUser(s, { method: 'onStatus', nodeid: nodeid, state: state, rate: command.rate }); });
+                if (state === 'stopped' || state === 'error') { endStream(nodeid, state, code, msg); break; }
+                if (state === 'started') {
+                    // An agent core that predates consent support would capture
+                    // without asking: refuse it where consent is required.
+                    if (st.consent && !command.proto) {
+                        sendAgent(agent, { pluginaction: 'stop', sid: sid });
+                        endStream(nodeid, 'error', 'agent_outdated', 'На устройстве требуется согласие пользователя, а ядро агента устарело — обновите ядро агента');
+                        break;
+                    }
+                    st.ready = true;
+                    if (command.rate) st.rate = command.rate;
+                }
+                st.listeners.forEach(function (s) { sendStatus(s, nodeid, state, code, msg, { rate: command.rate, timeout: command.timeout }); });
+                break;
+            case 'consentresult':
+                var sess = st.pending[command.reqid];
+                if (!sess) return;
+                delete st.pending[command.reqid];
+                if (command.ok) {
+                    attach(st, sess);
+                    sendStatus(sess, nodeid, 'started', '', '', { rate: st.rate });
+                } else {
+                    sendStatus(sess, nodeid, 'error', 'consent_denied', 'Пользователь не разрешил прослушивание');
+                    if (st.listeners.length === 0 && Object.keys(st.pending).length === 0) removeListener(nodeid, sess);
+                }
                 break;
         }
     }
@@ -355,7 +466,11 @@ module.exports.deskaudio = function (parent) {
             cbtn.addEventListener('click', function () {
                 var P2 = pluginHandler.deskaudio, s2 = P2._s || {};
                 var auto = false; try { auto = (localStorage.getItem('deskaudio_auto') === '1'); } catch (e) { }
+                // The same button also disconnects: only start if, after MeshCentral
+                // handled the click, a desktop session is actually connecting/connected.
                 if (auto && !s2.active) setTimeout(function () {
+                    if (typeof desktop === 'undefined' || desktop == null || !desktop.State) return;
+                    if ((pluginHandler.deskaudio._s || {}).active) return;
                     pluginHandler.deskaudio.start();
                 }, 300);
             });
@@ -458,6 +573,16 @@ module.exports.deskaudio = function (parent) {
         if (!m || m.nodeid !== s.nodeid) return;
         if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }  // agent responded
         if (m.state === 'started') s.statusText = 'Идёт передача звука' + (m.rate ? ' (' + (m.rate / 1000) + ' кГц)' : '');
+        else if (m.state === 'waiting') {
+            // The local user is being asked for consent: wait for their answer
+            // (plus a margin) instead of the usual connect timeout.
+            s.statusText = 'Ожидание разрешения пользователя…';
+            var wt = ((m.timeout > 0 ? m.timeout : 30) + 10) * 1000;
+            s.connectTimer = setTimeout(function () {
+                var Pt = pluginHandler.deskaudio, st2 = Pt._s || {};
+                if (st2.active && !st2.gotAudio) { Pt.stop(); st2.statusText = 'Нет ответа от агента'; Pt.render(); }
+            }, wt);
+        }
         else if (m.state === 'error' || m.state === 'stopped') {
             try { if (s.ctx) s.ctx.close(); } catch (e) { }
             s.ctx = null; s.gain = null; s.active = false;

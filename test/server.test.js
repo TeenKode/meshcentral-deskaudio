@@ -52,8 +52,8 @@ test("first listener with rights starts capture on the agent", () => {
     assert.ok(typeof cmd.exe32 === "string" && cmd.exe32.length > 0, "windows x86 native helper included");
     assert.ok(typeof cmd.ver64 === "string" && cmd.ver64.length > 0, "x64 helper version hash included");
     assert.ok(typeof cmd.ver32 === "string" && cmd.ver32.length > 0, "x86 helper version hash included");
-    assert.ok(typeof cmd.source === "string" && cmd.source.length > 0, "windows helper source (fallback) included");
-    assert.ok(typeof cmd.ver === "string" && cmd.ver.length > 0, "helper version hash included");
+    assert.strictEqual(cmd.source, undefined, "no C# fallback source is sent");
+    assert.strictEqual(typeof cmd.sid, "number", "capture carries a session id");
     // Start is logged to the device event log.
     assert.strictEqual(meshServer.events.length, 1);
     assert.strictEqual(meshServer.events[0].action, "deskaudio");
@@ -313,4 +313,163 @@ test("a new stream beyond the server-wide cap is rejected", () => {
     const st = lastStatus(over.ws);
     assert.ok(st && st.state === "error");
     assert.match(st.msg, /слишком много одновременных/i);
+});
+
+// ---------- session ids, races, rights, consent ----------
+
+function agentStarts(agent) { return agent.sent.filter((m) => m.pluginaction === "start"); }
+
+test("a stale 'stopped' from the previous capture does not end a new one", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = makeWeb();
+    const sess = makeUserSession();
+
+    userStart(obj, sess, web);
+    const sid1 = agentStarts(agent)[0].sid;
+    userStop(obj, sess, web);
+    const stop = agent.sent.filter((m) => m.pluginaction === "stop").pop();
+    assert.strictEqual(stop.sid, sid1, "stop names the capture it ends");
+    userStart(obj, sess, web);
+    const sid2 = agentStarts(agent)[1].sid;
+    assert.notStrictEqual(sid1, sid2, "a new capture gets a new session id");
+
+    // The agent's answer to the first stop arrives after the new start.
+    agentMsg(obj, agent, { pluginaction: "status", sid: sid1, state: "stopped" });
+    agentMsg(obj, agent, { pluginaction: "chunk", sid: sid1, rate: 16000, d: "T0xE" });
+    agentMsg(obj, agent, { pluginaction: "status", sid: sid2, state: "started", proto: 2, rate: 16000 });
+    agentMsg(obj, agent, { pluginaction: "chunk", sid: sid2, rate: 16000, d: "TkVX" });
+
+    const chunks = sess.ws.sent.filter((m) => m.method === "onChunk");
+    assert.deepStrictEqual(chunks.map((c) => c.d), ["TkVX"], "only the new capture's audio is relayed");
+    assert.strictEqual(lastStatus(sess.ws).state, "started", "the new session was not ended");
+});
+
+test("a stop that arrives before the rights check finishes cancels the start", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = makeWeb();
+    let pendingCb = null;
+    web.GetNodeWithRights = function (domain, user, nodeid, cb) { pendingCb = () => cb(this.node, this.rights); };
+    const sess = makeUserSession();
+
+    userStart(obj, sess, web);
+    userStop(obj, sess, web);
+    pendingCb();
+
+    assert.strictEqual(agentStarts(agent).length, 0, "no capture started after the user stopped");
+});
+
+test("NODESKTOP denies audio, full administrator rights allow it", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const denied = makeUserSession({ userid: "user//d" });
+    userStart(obj, denied, makeWeb({ rights: 0x8 | 0x10000 }));
+    assert.strictEqual(lastStatus(denied.ws).code, "no_rights");
+    assert.strictEqual(agentStarts(agent).length, 0);
+
+    userStart(obj, makeUserSession({ userid: "user//admin" }), makeWeb({ rights: 0xFFFFFFFF }));
+    assert.strictEqual(agentStarts(agent).length, 1, "full rights include remote control");
+});
+
+function consentWeb(consent, domain) {
+    const web = makeWeb();
+    web.meshes = { "mesh//m1": { consent } };
+    return web;
+}
+
+test("device-group consent flags are passed to the agent", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const sess = makeUserSession({ name: "bob" });
+    sess.domain = { id: "", userconsentflags: 1, consentmessages: { title: "Corp", consenttimeout: 15 } };
+    userStart(obj, sess, consentWeb(8));
+    const c = agentStarts(agent)[0].consent;
+    assert.strictEqual(c.prompt, true, "group asks for consent");
+    assert.strictEqual(c.notify, true, "server-wide notify flag added");
+    assert.strictEqual(c.title, "Corp");
+    assert.strictEqual(c.timeout, 15);
+    assert.match(c.msg, /bob/);
+});
+
+test("with consent required, audio flows only after the agent confirms", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const sess = makeUserSession();
+    userStart(obj, sess, consentWeb(8));
+    const sid = agentStarts(agent)[0].sid;
+
+    agentMsg(obj, agent, { pluginaction: "status", sid, state: "waiting", code: "consent_wait", timeout: 30 });
+    assert.strictEqual(lastStatus(sess.ws).state, "waiting");
+    assert.strictEqual(lastStatus(sess.ws).timeout, 30);
+    agentMsg(obj, agent, { pluginaction: "chunk", sid, rate: 16000, d: "QUJD" });
+    assert.ok(!sess.ws.sent.some((m) => m.method === "onChunk"), "no audio before consent");
+
+    agentMsg(obj, agent, { pluginaction: "status", sid, state: "started", proto: 2, rate: 16000 });
+    agentMsg(obj, agent, { pluginaction: "chunk", sid, rate: 16000, d: "QUJD" });
+    assert.ok(sess.ws.sent.some((m) => m.method === "onChunk"), "audio after consent");
+});
+
+test("an outdated agent core is refused where consent is required", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const sess = makeUserSession();
+    userStart(obj, sess, consentWeb(1));
+    // Old cores answer without sid/proto.
+    agentMsg(obj, agent, { pluginaction: "status", state: "started", rate: 16000 });
+    assert.strictEqual(lastStatus(sess.ws).code, "agent_outdated");
+    assert.ok(agent.sent.some((m) => m.pluginaction === "stop"), "the capture is stopped");
+});
+
+test("a further listener on a consent device is asked for separately", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = consentWeb(8);
+    const a = makeUserSession({ userid: "user//a" });
+    const b = makeUserSession({ userid: "user//b" });
+    const c = makeUserSession({ userid: "user//c" });
+    userStart(obj, a, web);
+    const sid = agentStarts(agent)[0].sid;
+    agentMsg(obj, agent, { pluginaction: "status", sid, state: "started", proto: 2, rate: 16000 });
+
+    userStart(obj, b, web);
+    userStart(obj, c, web);
+    const asks = agent.sent.filter((m) => m.pluginaction === "consent");
+    assert.strictEqual(asks.length, 2, "the agent is asked once per new user");
+    assert.strictEqual(lastStatus(b.ws).state, "waiting");
+
+    agentMsg(obj, agent, { pluginaction: "consentresult", sid, reqid: asks[0].reqid, ok: true });
+    agentMsg(obj, agent, { pluginaction: "consentresult", sid, reqid: asks[1].reqid, ok: false });
+    assert.strictEqual(lastStatus(b.ws).state, "started");
+    assert.strictEqual(lastStatus(c.ws).code, "consent_denied");
+
+    agentMsg(obj, agent, { pluginaction: "chunk", sid, rate: 16000, d: "QUJD" });
+    assert.ok(b.ws.sent.some((m) => m.method === "onChunk"), "approved listener hears audio");
+    assert.ok(!c.ws.sent.some((m) => m.method === "onChunk"), "denied listener hears nothing");
+});
+
+test("a further listener on a notify-only device triggers a notification", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = consentWeb(1);
+    userStart(obj, makeUserSession({ userid: "user//a" }), web);
+    userStart(obj, makeUserSession({ userid: "user//b" }), web);
+    assert.strictEqual(agent.sent.filter((m) => m.pluginaction === "notify").length, 1);
+});
+
+test("chunks with an invalid rate are dropped", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const sess = makeUserSession();
+    userStart(obj, sess, makeWeb());
+    agentMsg(obj, agent, { pluginaction: "chunk", rate: 1, d: "QUJD" });
+    agentMsg(obj, agent, { pluginaction: "chunk", rate: "x", d: "QUJD" });
+    assert.ok(!sess.ws.sent.some((m) => m.method === "onChunk"));
+});
+
+test("server-generated errors carry a stable code", () => {
+    const { obj } = loadPlugin();
+    const sess = makeUserSession();
+    userStart(obj, sess, makeWeb());
+    assert.strictEqual(lastStatus(sess.ws).code, "offline");
 });
