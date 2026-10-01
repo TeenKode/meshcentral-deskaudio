@@ -14,7 +14,7 @@ module.exports.deskaudio = function (parent) {
     var obj = {};
     obj.parent = parent;
     obj.meshServer = parent.parent;
-    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'onChunk', 'onStatus'];
+    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'onChunk', 'onStatus', 'onDesktopDisconnect'];
 
     var fs = require('fs');
     var path = require('path');
@@ -259,6 +259,7 @@ module.exports.deskaudio = function (parent) {
         var s = P._s = P._s || {};
         pluginHandler.registerPluginTab({ tabId: 'pluginDeskAudio', tabTitle: 'Звук' });
         if (s.active && typeof currentNode !== 'undefined' && currentNode && s.nodeid !== currentNode._id) P.stop();
+        var autoOn = false; try { autoOn = (localStorage.getItem('deskaudio_auto') === '1'); } catch (e) { }
         QH('pluginDeskAudio',
             '<div style="padding:10px;max-width:520px">' +
             '<b>Звук рабочего стола</b>' +
@@ -270,9 +271,38 @@ module.exports.deskaudio = function (parent) {
             '<option value="24000">24 кГц — лучше</option></select></div>' +
             '<div style="margin:6px 0"><input type="button" id="da_btn" value="Слушать" onclick="pluginHandler.deskaudio.toggle()"> ' +
             ' Громкость <input type="range" id="da_vol" min="0" max="100" value="80" oninput="pluginHandler.deskaudio.setVolume(this.value)"></div>' +
+            '<div style="margin:6px 0"><label><input type="checkbox" id="da_auto" onchange="pluginHandler.deskaudio.setAuto(this.checked)"> ' +
+            'Слушать звук при подключении к рабочему столу</label></div>' +
             '<div style="height:8px;background:rgba(128,128,128,.25);border-radius:4px;overflow:hidden;margin:6px 0">' +
             '<div id="da_bar" style="height:100%;width:0;background:#4a9;"></div></div>' +
             '<div id="da_status" style="font-size:12px;opacity:.8"></div></div>');
+        var ac = document.getElementById('da_auto'); if (ac) ac.checked = autoOn;
+
+        // Button in the Desktop tab's official custom-UI slot (survives version changes).
+        var slot = document.getElementById('desktopCustomUiButtons');
+        if (slot && !document.getElementById('da_deskbtn')) {
+            var db = document.createElement('input');
+            db.type = 'button'; db.id = 'da_deskbtn';
+            db.title = 'Слушать звук рабочего стола';
+            db.onclick = function () { pluginHandler.deskaudio.toggle(); };
+            slot.appendChild(db);
+        }
+
+        // Auto-start on desktop connect. MeshCentral has no onDesktopConnect hook,
+        // so hook the Connect button; audio runs over its own channel and does not
+        // depend on the desktop stream. Stop is handled by onDesktopDisconnect.
+        var cbtn = document.getElementById('connectbutton1');
+        if (cbtn && !cbtn._daHooked) {
+            cbtn._daHooked = true;
+            cbtn.addEventListener('click', function () {
+                var P2 = pluginHandler.deskaudio, s2 = P2._s || {};
+                var auto = false; try { auto = (localStorage.getItem('deskaudio_auto') === '1'); } catch (e) { }
+                if (auto && !s2.active) setTimeout(function () {
+                    var P3 = pluginHandler.deskaudio; P3.start();
+                    try { P3._s.autoStarted = true; } catch (e) { }
+                }, 300);
+            });
+        }
         P.render();
     };
 
@@ -284,6 +314,8 @@ module.exports.deskaudio = function (parent) {
         if (r) r.disabled = !!s.active;
         var st = document.getElementById('da_status');
         if (st) st.textContent = s.statusText || '';
+        var db = document.getElementById('da_deskbtn');
+        if (db) db.value = s.active ? '⏹ Звук' : '🔊 Звук';
         if (!s.active) { var bar = document.getElementById('da_bar'); if (bar) bar.style.width = '0'; }
     };
 
@@ -307,6 +339,7 @@ module.exports.deskaudio = function (parent) {
         s.next = 0;
         s.nodeid = currentNode._id;
         s.active = true;
+        s.autoStarted = false;   // manual start by default; the auto path sets this true afterwards
         s.statusText = 'Подключение…';
         var r = document.getElementById('da_rate');
         meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'start', nodeid: s.nodeid, rate: r ? parseInt(r.value, 10) : 16000 });
@@ -318,13 +351,23 @@ module.exports.deskaudio = function (parent) {
         var s = P._s = P._s || {};
         if (s.nodeid) meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'stop', nodeid: s.nodeid });
         try { if (s.ctx) s.ctx.close(); } catch (e) { }
-        s.ctx = null; s.gain = null; s.active = false; s.statusText = 'Остановлено';
+        s.ctx = null; s.gain = null; s.active = false; s.autoStarted = false; s.statusText = 'Остановлено';
         P.render();
     };
 
     obj.setVolume = function (val) {
         var s = pluginHandler.deskaudio._s || {};
         if (s.gain) s.gain.gain.value = val / 100;
+    };
+
+    // Remembered per-browser default: auto-listen when connecting to the desktop.
+    obj.setAuto = function (on) { try { localStorage.setItem('deskaudio_auto', on ? '1' : '0'); } catch (e) { } };
+
+    // Called by MeshCentral when the remote desktop disconnects. Stop the audio
+    // only if it was started automatically, so manual listening is left alone.
+    obj.onDesktopDisconnect = function () {
+        var s = pluginHandler.deskaudio._s || {};
+        if (s.autoStarted) pluginHandler.deskaudio.stop();
     };
 
     obj.onStatus = function (a, b) {
@@ -335,7 +378,7 @@ module.exports.deskaudio = function (parent) {
         if (m.state === 'started') s.statusText = 'Идёт передача звука' + (m.rate ? ' (' + (m.rate / 1000) + ' кГц)' : '');
         else if (m.state === 'error' || m.state === 'stopped') {
             try { if (s.ctx) s.ctx.close(); } catch (e) { }
-            s.ctx = null; s.gain = null; s.active = false;
+            s.ctx = null; s.gain = null; s.active = false; s.autoStarted = false;
             s.statusText = (m.state === 'error' ? 'Ошибка: ' : 'Остановлено. ') + (m.msg || '');
         }
         P.render();
