@@ -67,9 +67,52 @@ function startLinux(a) {
     run('/bin/sh', ['sh', p, String(curRate)]);
 }
 
+// Directory of the running MeshAgent (e.g. C:\Program Files\Mesh Agent). This
+// folder is normally already in the antivirus exclusions (Dr.Web and others
+// whitelist the agent by path), so running the helper from here keeps it out of
+// the scanner's way and gives a single, stable path an admin can exclude once.
+function agentDir() {
+    try {
+        var p = process.execPath;
+        if (p) {
+            var i = p.lastIndexOf('\\'); if (i < 0) i = p.lastIndexOf('/');
+            if (i > 0) return p.substring(0, i);
+        }
+    } catch (e) { }
+    return null;
+}
+
+// Candidate directories for the helper, most-excluded first: the agent folder,
+// then %TEMP% as a fallback if that folder is not writable.
+function winHelperDirs() {
+    var tmp = process.env['TEMP'] || process.env['TMP'] || ((process.env['windir'] || 'C:\\Windows') + '\\Temp');
+    var dirs = [];
+    var ad = agentDir();
+    if (ad) dirs.push(ad);
+    dirs.push(tmp);
+    return dirs;
+}
+
+// Write `data` to <dir>\<name> under a fixed name so the path is stable across
+// plugin versions. A sidecar "<name>.ver" records the content version; the file
+// is rewritten only when that version changes. Returns the path or null.
+function dropFile(fs, dir, name, ver, data) {
+    try {
+        var p = dir + '\\' + name;
+        var vp = p + '.ver';
+        var cur = null;
+        try { cur = fs.readFileSync(vp).toString(); } catch (e) { }
+        if (cur !== ver || !fs.existsSync(p)) {
+            fs.writeFileSync(p, data);
+            try { fs.writeFileSync(vp, Buffer.from(ver)); } catch (e) { }
+        }
+        return fs.existsSync(p) ? p : null;
+    } catch (e) { return null; }
+}
+
 function startWin(a) {
     var fs = require('fs');
-    var tmp = process.env['TEMP'] || process.env['TMP'] || ((process.env['windir'] || 'C:\\Windows') + '\\Temp');
+    var hdirs = winHelperDirs();
 
     // 1) Preferred: a prebuilt native helper — no .NET or compiler on the target.
     //    Use the 64-bit build on a 64-bit OS, the 32-bit build otherwise; the
@@ -81,19 +124,20 @@ function startWin(a) {
     var exeVer = os64 ? a.ver64 : a.ver32;
     if (!exeB64) { exeB64 = a.exe32; exeVer = a.ver32; }
     if (exeB64 && exeVer) {
-        try {
-            var pre = tmp + '\\deskaudio_' + exeVer + '.exe';
-            if (!fs.existsSync(pre)) fs.writeFileSync(pre, Buffer.from(exeB64, 'base64'));
-            if (fs.existsSync(pre)) return run(pre, ['deskaudio.exe', String(curRate)]);
-        } catch (e) { /* fall through to compiling the C# helper */ }
+        var data = Buffer.from(exeB64, 'base64');
+        for (var i = 0; i < hdirs.length; i++) {
+            var p = dropFile(fs, hdirs[i], 'deskaudio-helper.exe', exeVer, data);
+            if (p) return run(p, ['deskaudio.exe', String(curRate)]);
+        }
     }
 
     // 2) Fallback: compile the C# helper with any csc.exe from the .NET Framework.
     if (!a.source || !a.ver) return fail('Нет хелпера для Windows');
-    var exe = tmp + '\\deskaudio_' + a.ver + '.exe';
+    var dir = hdirs[0];
+    var exe = dir + '\\deskaudio-helper-cs.exe';
     if (fs.existsSync(exe)) return run(exe, ['deskaudio.exe', String(curRate)]);
 
-    var src = tmp + '\\deskaudio_' + a.ver + '.cs';
+    var src = dir + '\\deskaudio-helper.cs';
     try { fs.writeFileSync(src, Buffer.from(a.source, 'base64')); } catch (e) { return fail('Не удалось записать исходник: ' + e); }
     // Find any csc.exe shipped with the .NET Framework. Try newest first (v4 on
     // Win8/10/11), then fall back to v3.5 / v2.0 which are built into Windows 7
@@ -101,11 +145,11 @@ function startWin(a) {
     // on the matching CLR, so no single version has to be present everywhere.
     var win = process.env['windir'] || 'C:\\Windows';
     var vers = ['v4.0.30319', 'v3.5', 'v2.0.50727'];
-    var dirs = ['Framework64', 'Framework'];
+    var fdirs = ['Framework64', 'Framework'];
     var csc = null;
     for (var vi = 0; vi < vers.length && !csc; vi++) {
-        for (var di = 0; di < dirs.length; di++) {
-            var cand = win + '\\Microsoft.NET\\' + dirs[di] + '\\' + vers[vi] + '\\csc.exe';
+        for (var di = 0; di < fdirs.length; di++) {
+            var cand = win + '\\Microsoft.NET\\' + fdirs[di] + '\\' + vers[vi] + '\\csc.exe';
             if (fs.existsSync(cand)) { csc = cand; break; }
         }
     }

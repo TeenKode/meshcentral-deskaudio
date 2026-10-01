@@ -51,6 +51,65 @@ module.exports.deskaudio = function (parent) {
         return helperCache;
     }
 
+    // Sign the native Windows helpers with the same code-signing certificate
+    // MeshCentral uses for its agents (obj.certificates.codesign), via the built-in
+    // authenticode.js module. Best-effort: if there is no code-signing certificate
+    // or the module can't be loaded, the helpers are shipped as-is. Signed bytes
+    // replace the cached copies in place, so the agent re-drops the signed version
+    // (its version hash changes) on the next start.
+    function signHelpers() {
+        var mc = obj.meshServer;
+        if (!mc || !mc.certificates || !mc.certificates.codesign) {
+            log('signing skipped: no server code-signing certificate'); return;
+        }
+        var co = mc.certificateOperations, forge = co && co.forge;
+        if (!forge) { log('signing skipped: certificate operations unavailable'); return; }
+
+        var authenticode = null;
+        try {
+            var mainFile = (require.main && require.main.filename) || (process.mainModule && process.mainModule.filename);
+            if (mainFile) authenticode = require(path.join(path.dirname(mainFile), 'authenticode.js'));
+        } catch (e) { }
+        if (!authenticode) { try { authenticode = require('./authenticode.js'); } catch (e) { } }
+        if (!authenticode || typeof authenticode.createAuthenticodeHandler !== 'function') {
+            log('signing skipped: authenticode module not found'); return;
+        }
+
+        var certInfo;
+        try {
+            certInfo = {
+                cert: forge.pki.certificateFromPem(mc.certificates.codesign.cert),
+                key: forge.pki.privateKeyFromPem(mc.certificates.codesign.key)
+            };
+            if (mc.certificates.root && mc.certificates.root.cert)
+                certInfo.extraCerts = [forge.pki.certificateFromPem(mc.certificates.root.cert)];
+        } catch (e) { log('signing skipped: cannot read certificate: ' + e); return; }
+
+        var h;
+        try { h = loadHelpers(); } catch (e) { return; }
+        var outDir = mc.datapath || __dirname;
+
+        [['deskaudio-x64.exe', 'exe64', 'ver64'], ['deskaudio-x86.exe', 'exe32', 'ver32']].forEach(function (f) {
+            try {
+                var inPath = path.join(__dirname, 'helpers', f[0]);
+                var outPath = path.join(outDir, 'deskaudio-signed-' + f[0]);
+                var hnd = authenticode.createAuthenticodeHandler(inPath);
+                if (!hnd) return;
+                hnd.sign(certInfo, { hash: 'sha384', out: outPath, desc: 'Desktop Audio helper' }, function (err) {
+                    try {
+                        if (!err) {
+                            var signed = fs.readFileSync(outPath);
+                            h[f[1]] = signed.toString('base64');
+                            h[f[2]] = md5(signed);
+                            log('signed ' + f[0] + ' with server code-signing certificate');
+                        } else { log('signing failed for ' + f[0] + ': ' + err); }
+                    } catch (e) { }
+                    try { hnd.close(); } catch (e) { }
+                });
+            } catch (e) { log('signing error for ' + f[0] + ': ' + e); }
+        });
+    }
+
     function agentOf(nodeid) {
         var wa = obj.meshServer.webserver.wsagents;
         return (wa && wa[nodeid]) ? wa[nodeid] : null;
@@ -189,7 +248,7 @@ module.exports.deskaudio = function (parent) {
         } catch (ex) { log('serveraction error: ' + ex); }
     };
 
-    obj.server_startup = function () { log('loaded'); };
+    obj.server_startup = function () { log('loaded'); try { signHelpers(); } catch (e) { log('signHelpers error: ' + e); } };
 
     // =====================================================================
     //  Everything below runs in the BROWSER (serialized via obj.exports)
