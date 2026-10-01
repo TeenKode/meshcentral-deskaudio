@@ -128,7 +128,8 @@ test("listeners beyond the cap are rejected", () => {
     const { obj, meshServer } = loadPlugin();
     const agent = connectAgent(meshServer, NODE);
     const web = makeWeb();
-    for (let i = 0; i < 3; i++) userStart(obj, makeUserSession({ userid: "user//" + i }), web);
+    const CAP = 10;   // MAX_LISTENERS_PER_NODE
+    for (let i = 0; i < CAP; i++) userStart(obj, makeUserSession({ userid: "user//" + i }), web);
     const overflow = makeUserSession({ userid: "user//over" });
     userStart(obj, overflow, web);
     const st = lastStatus(overflow.ws);

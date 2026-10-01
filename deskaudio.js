@@ -21,7 +21,7 @@ module.exports.deskaudio = function (parent) {
     var crypto = require('crypto');
 
     var MESHRIGHT_REMOTECONTROL = 0x00000008;
-    var MAX_LISTENERS_PER_NODE = 3;
+    var MAX_LISTENERS_PER_NODE = 10;
     var KEEPALIVE_MS = 15000;
     var listeners = {};          // nodeid -> [user session objects]
     var keepTimer = null;
@@ -319,8 +319,7 @@ module.exports.deskaudio = function (parent) {
                 var P2 = pluginHandler.deskaudio, s2 = P2._s || {};
                 var auto = false; try { auto = (localStorage.getItem('deskaudio_auto') === '1'); } catch (e) { }
                 if (auto && !s2.active) setTimeout(function () {
-                    var P3 = pluginHandler.deskaudio; P3.start();
-                    try { P3._s.autoStarted = true; } catch (e) { }
+                    pluginHandler.deskaudio.start();
                 }, 300);
             });
         }
@@ -362,7 +361,6 @@ module.exports.deskaudio = function (parent) {
         s.next = 0;
         s.nodeid = currentNode._id;
         s.active = true;
-        s.autoStarted = false;   // manual start by default; the auto path sets this true afterwards
         s.gotAudio = false;
         s.statusText = 'Подключение…';
         // Don't hang on "Подключение…": if the agent never responds, reset.
@@ -382,7 +380,7 @@ module.exports.deskaudio = function (parent) {
         if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }
         if (s.nodeid) meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'stop', nodeid: s.nodeid });
         try { if (s.ctx) s.ctx.close(); } catch (e) { }
-        s.ctx = null; s.gain = null; s.active = false; s.autoStarted = false; s.statusText = 'Остановлено';
+        s.ctx = null; s.gain = null; s.active = false; s.statusText = 'Остановлено';
         P.render();
     };
 
@@ -394,11 +392,10 @@ module.exports.deskaudio = function (parent) {
     // Remembered per-browser default: auto-listen when connecting to the desktop.
     obj.setAuto = function (on) { try { localStorage.setItem('deskaudio_auto', on ? '1' : '0'); } catch (e) { } };
 
-    // Called by MeshCentral when the remote desktop disconnects. Stop the audio
-    // only if it was started automatically, so manual listening is left alone.
+    // Called by MeshCentral when the remote desktop disconnects. Audio is tied to
+    // the desktop session, so stop listening whenever the desktop is closed.
     obj.onDesktopDisconnect = function () {
-        var s = pluginHandler.deskaudio._s || {};
-        if (s.autoStarted) pluginHandler.deskaudio.stop();
+        if ((pluginHandler.deskaudio._s || {}).active) pluginHandler.deskaudio.stop();
     };
 
     obj.onStatus = function (a, b) {
@@ -410,7 +407,7 @@ module.exports.deskaudio = function (parent) {
         if (m.state === 'started') s.statusText = 'Идёт передача звука' + (m.rate ? ' (' + (m.rate / 1000) + ' кГц)' : '');
         else if (m.state === 'error' || m.state === 'stopped') {
             try { if (s.ctx) s.ctx.close(); } catch (e) { }
-            s.ctx = null; s.gain = null; s.active = false; s.autoStarted = false;
+            s.ctx = null; s.gain = null; s.active = false;
             s.statusText = (m.state === 'error' ? 'Ошибка: ' : 'Остановлено. ') + (m.msg || '');
         }
         P.render();
