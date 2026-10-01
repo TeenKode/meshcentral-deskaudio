@@ -12,11 +12,13 @@
 set -e
 cd "$(dirname "$0")"
 
-FLAGS="-O2 -static -static-libgcc -static-libstdc++ -s -Wl,--no-insert-timestamp"
-LIBS="-lole32"
+# Passed to both compilers as separate arguments. Kept as positional parameters
+# and expanded with "$@" (not an unquoted $FLAGS) so the flags survive word
+# splitting without tripping shellcheck SC2086.
+set -- -O2 -static -static-libgcc -static-libstdc++ -s -Wall -Wl,--no-insert-timestamp
 
-x86_64-w64-mingw32-g++ -o deskaudio-x64.exe win-loopback-native.cpp $FLAGS $LIBS
-i686-w64-mingw32-g++   -o deskaudio-x86.exe win-loopback-native.cpp $FLAGS $LIBS
+x86_64-w64-mingw32-g++ -o deskaudio-x64.exe win-loopback-native.cpp "$@" -lole32
+i686-w64-mingw32-g++   -o deskaudio-x86.exe win-loopback-native.cpp "$@" -lole32
 
 echo "built:"
 ls -la deskaudio-x64.exe deskaudio-x86.exe

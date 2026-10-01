@@ -80,9 +80,22 @@ function fakeChild() {
 
 // Run `fn` with execFile, setInterval and optional extra modules mocked; fresh
 // agent module per call so its closure state does not leak between tests.
+//
+// opts.platform pins process.platform for the duration of the test. The agent
+// branches on it to pick a capture backend, which would otherwise make the Linux
+// tests pass in CI (Ubuntu) and fail on a Windows dev box. When we shadow it we
+// keep process.execPath reachable, because agentDir() derives the helper folder
+// from it and a shadowed object would hide that property.
 function withAgent(opts, fn) {
     const calls = [];
     const realExec = cp.execFile, realLoad = Module._load, realSI = global.setInterval;
+    const realPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    const realExecPath = Object.getOwnPropertyDescriptor(process, "execPath");
+    const pinPlatform = !!opts.platform;
+    if (pinPlatform) {
+        Object.defineProperty(process, "platform", { value: opts.platform, configurable: true });
+        if (realExecPath) Object.defineProperty(process, "execPath", { value: realExecPath.value, configurable: true });
+    }
     cp.execFile = (file, args) => { const c = fakeChild(); calls.push({ file, args, child: c }); return c; };
     global.setInterval = () => 1;
     Module._load = function (req) {
@@ -95,7 +108,13 @@ function withAgent(opts, fn) {
     const sent = [];
     const parent = { SendCommand(o) { sent.push(JSON.parse(JSON.stringify(o))); } };
     const act = (args) => ag.consoleaction(args, 0, 0, parent);
-    const restore = () => { cp.execFile = realExec; Module._load = realLoad; global.setInterval = realSI; };
+    const restore = () => {
+        cp.execFile = realExec; Module._load = realLoad; global.setInterval = realSI;
+        if (pinPlatform) {
+            Object.defineProperty(process, "platform", realPlatform);
+            if (realExecPath) Object.defineProperty(process, "execPath", realExecPath);
+        }
+    };
     let r;
     try { r = fn({ ag, act, sent, calls }); }
     catch (e) { restore(); throw e; }
@@ -107,7 +126,7 @@ function withAgent(opts, fn) {
 const SCRIPT = Buffer.from("echo capture").toString("base64");
 
 test("Linux: the capture script runs inline via sh -c, never from /tmp", () => {
-    withAgent({}, ({ act, sent, calls }) => {
+    withAgent({ platform: "linux" }, ({ act, sent, calls }) => {
         act({ pluginaction: "start", sid: 7, rate: 24000, script: SCRIPT });
         assert.strictEqual(calls.length, 1);
         assert.strictEqual(calls[0].file, "/bin/sh");
@@ -120,7 +139,7 @@ test("Linux: the capture script runs inline via sh -c, never from /tmp", () => {
 });
 
 test("chunks carry the session id; a stop for another session is ignored", () => {
-    withAgent({}, ({ act, sent, calls }) => {
+    withAgent({ platform: "linux" }, ({ act, sent, calls }) => {
         act({ pluginaction: "start", sid: 3, rate: 16000, compress: false, script: SCRIPT });
         const pcm = Buffer.alloc(64); pcm.writeInt16LE(1000, 0);
         calls[0].child.stdout.emit("data", pcm);
@@ -140,7 +159,7 @@ test("chunks carry the session id; a stop for another session is ignored", () =>
 test("consent: capture starts only after the local user accepts", async () => {
     let resolve;
     const box = { create: () => new Promise((res) => { resolve = res; }) };
-    await withAgent({ modules: { "message-box": box } }, async ({ act, sent, calls }) => {
+    await withAgent({ platform: "linux", modules: { "message-box": box } }, async ({ act, sent, calls }) => {
         act({ pluginaction: "start", sid: 1, rate: 16000, script: SCRIPT, consent: { prompt: true, msg: "?", timeout: 20 } });
         assert.strictEqual(calls.length, 0, "nothing captured while waiting");
         const w = sent.find((m) => m.state === "waiting");
@@ -154,7 +173,7 @@ test("consent: capture starts only after the local user accepts", async () => {
 test("consent: a refusal reports consent_denied and captures nothing", async () => {
     let reject;
     const box = { create: () => new Promise((res, rej) => { reject = rej; }) };
-    await withAgent({ modules: { "message-box": box } }, async ({ act, sent, calls }) => {
+    await withAgent({ platform: "linux", modules: { "message-box": box } }, async ({ act, sent, calls }) => {
         act({ pluginaction: "start", sid: 1, rate: 16000, script: SCRIPT, consent: { prompt: true, msg: "?" } });
         reject(new Error("denied"));
         await new Promise((r) => setImmediate(r));
@@ -165,7 +184,7 @@ test("consent: a refusal reports consent_denied and captures nothing", async () 
 
 test("consent: without an interactive session, autoAcceptNoUser decides", () => {
     const box = { create: () => { throw new Error("no session"); } };
-    withAgent({ modules: { "message-box": box } }, ({ act, sent, calls }) => {
+    withAgent({ platform: "linux", modules: { "message-box": box } }, ({ act, sent, calls }) => {
         act({ pluginaction: "start", sid: 1, rate: 16000, script: SCRIPT, consent: { prompt: true, msg: "?" } });
         assert.strictEqual(calls.length, 0);
         assert.strictEqual(sent.pop().code, "consent_denied");
