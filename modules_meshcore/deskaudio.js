@@ -74,10 +74,21 @@ function startWin(a) {
 
     var src = tmp + '\\deskaudio_' + a.ver + '.cs';
     try { fs.writeFileSync(src, Buffer.from(a.source, 'base64')); } catch (e) { return fail('Не удалось записать исходник: ' + e); }
+    // Find any csc.exe shipped with the .NET Framework. Try newest first (v4 on
+    // Win8/10/11), then fall back to v3.5 / v2.0 which are built into Windows 7
+    // by default. Each machine compiles with its own compiler and runs the result
+    // on the matching CLR, so no single version has to be present everywhere.
     var win = process.env['windir'] || 'C:\\Windows';
-    var csc = win + '\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe';
-    if (!fs.existsSync(csc)) csc = win + '\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe';
-    if (!fs.existsSync(csc)) return fail('Не найден csc.exe (.NET Framework 4)');
+    var vers = ['v4.0.30319', 'v3.5', 'v2.0.50727'];
+    var dirs = ['Framework64', 'Framework'];
+    var csc = null;
+    for (var vi = 0; vi < vers.length && !csc; vi++) {
+        for (var di = 0; di < dirs.length; di++) {
+            var cand = win + '\\Microsoft.NET\\' + dirs[di] + '\\' + vers[vi] + '\\csc.exe';
+            if (fs.existsSync(cand)) { csc = cand; break; }
+        }
+    }
+    if (!csc) return fail('Не найден csc.exe (.NET Framework 2.0/3.5/4)');
 
     var out = '';
     var c = require('child_process').execFile(csc, ['csc.exe', '/nologo', '/optimize+', '/out:' + exe, src]);

@@ -1,6 +1,8 @@
 // WASAPI loopback capture of the default render device.
 // Writes raw s16le mono PCM at the requested rate to stdout.
-// Plain C# 5 so the csc.exe that ships with .NET Framework 4 can build it:
+// Plain C# 2.0 (no var / lambdas / generics / LINQ) so it builds with ANY csc.exe
+// that ships with the .NET Framework — v4 on Win8/10/11, or the v3.5 / v2.0
+// compiler built into Windows 7 by default. WASAPI loopback works since Vista.
 //   csc /nologo /optimize+ /out:deskaudio.exe win-loopback.cs
 using System;
 using System.IO;
