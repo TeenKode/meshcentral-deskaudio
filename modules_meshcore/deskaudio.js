@@ -38,6 +38,49 @@ function isSilent(buf) {
     return true;
 }
 
+// IMA ADPCM: ~4:1 compression (16-bit PCM -> 4-bit), no external library. Each
+// chunk is a self-contained block (4-byte header: predictor int16 LE + step
+// index + reserved, then 4-bit nibbles), so a dropped chunk never desyncs the
+// stream. The browser side (_adpcmDecode) mirrors this exactly.
+var IMA_STEP = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+    50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230,
+    253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963,
+    1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327,
+    3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442,
+    11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767];
+var IMA_INDEX = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
+
+function adpcmEncode(buf) {
+    var nSamp = buf.length >> 1;
+    var alloc = (typeof Buffer.alloc === 'function');
+    if (nSamp === 0) return alloc ? Buffer.alloc(0) : new Buffer(0);
+    function rd(i) { var v = buf[2 * i] | (buf[2 * i + 1] << 8); if (v & 0x8000) v -= 0x10000; return v; }
+    var predictor = rd(0), index = 0;
+    var size = 4 + (nSamp >> 1);
+    var out = alloc ? Buffer.alloc(size) : new Buffer(size);
+    out[0] = predictor & 0xFF; out[1] = (predictor >> 8) & 0xFF; out[2] = index & 0xFF; out[3] = 0;
+    var pos = 4, cur = 0, hi = false;
+    for (var i = 1; i < nSamp; i++) {
+        var sample = rd(i), step = IMA_STEP[index], diff = sample - predictor, code = 0;
+        if (diff < 0) { code = 8; diff = -diff; }
+        var vpdiff = step >> 3;
+        if (diff >= step) { code |= 4; diff -= step; vpdiff += step; }
+        step >>= 1;
+        if (diff >= step) { code |= 2; diff -= step; vpdiff += step; }
+        step >>= 1;
+        if (diff >= step) { code |= 1; vpdiff += step; }
+        if (code & 8) predictor -= vpdiff; else predictor += vpdiff;
+        if (predictor > 32767) predictor = 32767; else if (predictor < -32768) predictor = -32768;
+        index += IMA_INDEX[code];
+        if (index < 0) index = 0; else if (index > 88) index = 88;
+        if (!hi) { cur = code & 0x0F; hi = true; } else { out[pos++] = cur | ((code & 0x0F) << 4); hi = false; }
+    }
+    out[3] = hi ? 1 : 0;   // 1 => the last byte carries a padding (unused) high nibble
+    if (hi) { out[pos++] = cur; }
+    return out;
+}
+
 function spawn(path, args) {
     var cpm = require('child_process');
     if (process.platform == 'win32' && SPAWN_AS_USER) return cpm.execFile(path, args, { type: cpm.SpawnTypes.USER });
@@ -62,7 +105,7 @@ function run(path, args) {
     c.stdout.on('data', function (x) {
         if (child !== c) return;
         if (isSilent(x)) return;   // don't stream pure silence
-        send({ pluginaction: 'chunk', rate: curRate, d: x.toString('base64') });
+        send({ pluginaction: 'chunk', rate: curRate, codec: 'adpcm', d: adpcmEncode(x).toString('base64') });
     });
     c.on('exit', function (code) {
         if (child !== c) return;
@@ -212,4 +255,4 @@ function consoleaction(args, rights, sessionid, parent) {
     }
 }
 
-module.exports = { consoleaction: consoleaction, _isSilent: isSilent };
+module.exports = { consoleaction: consoleaction, _isSilent: isSilent, _adpcmEncode: adpcmEncode };

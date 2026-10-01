@@ -14,7 +14,7 @@ module.exports.deskaudio = function (parent) {
     var obj = {};
     obj.parent = parent;
     obj.meshServer = parent.parent;
-    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'onChunk', 'onStatus', 'onDesktopDisconnect'];
+    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode'];
 
     var fs = require('fs');
     var path = require('path');
@@ -242,7 +242,7 @@ module.exports.deskaudio = function (parent) {
         switch (command.pluginaction) {
             case 'chunk':
                 if (typeof command.d !== 'string' || command.d.length > 262144) return;
-                list.forEach(function (s) { sendUser(s, { method: 'onChunk', nodeid: nodeid, rate: command.rate, d: command.d }); });
+                list.forEach(function (s) { sendUser(s, { method: 'onChunk', nodeid: nodeid, rate: command.rate, codec: command.codec, d: command.d }); });
                 break;
             case 'status':
                 var state = String(command.state || '');
@@ -420,20 +420,66 @@ module.exports.deskaudio = function (parent) {
         P.render();
     };
 
+    // IMA ADPCM decoder — mirrors modules_meshcore/deskaudio.js adpcmEncode().
+    obj._adpcmDecode = function (bin) {
+        var STEP = [
+            7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+            50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230,
+            253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963,
+            1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327,
+            3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442,
+            11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767];
+        var IDX = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
+        var len = bin.length;
+        if (len < 4) return new Float32Array(0);
+        var predictor = bin.charCodeAt(0) | (bin.charCodeAt(1) << 8);
+        if (predictor & 0x8000) predictor -= 0x10000;
+        var index = bin.charCodeAt(2);
+        if (index < 0) index = 0; else if (index > 88) index = 88;
+        var pad = bin.charCodeAt(3) ? 1 : 0;   // drop the trailing padding nibble if present
+        var total = 1 + (len - 4) * 2 - pad;
+        var out = new Float32Array(total > 0 ? total : 0), oi = 0;
+        out[oi++] = predictor / 32768;
+        for (var b = 4; b < len && oi < total; b++) {
+            var byte = bin.charCodeAt(b);
+            for (var half = 0; half < 2 && oi < total; half++) {
+                var code = (half === 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+                var step = STEP[index], vpdiff = step >> 3;
+                if (code & 4) vpdiff += step;
+                if (code & 2) vpdiff += step >> 1;
+                if (code & 1) vpdiff += step >> 2;
+                if (code & 8) predictor -= vpdiff; else predictor += vpdiff;
+                if (predictor > 32767) predictor = 32767; else if (predictor < -32768) predictor = -32768;
+                index += IDX[code];
+                if (index < 0) index = 0; else if (index > 88) index = 88;
+                out[oi++] = predictor / 32768;
+            }
+        }
+        return out;
+    };
+
     obj.onChunk = function (a, b) {
         var m = (b !== undefined && b !== null) ? b : a;
         var s = (pluginHandler.deskaudio._s || {});
         if (!s.active || !s.ctx || !m || m.nodeid !== s.nodeid || typeof m.d !== 'string') return;
         var bin = atob(m.d);
-        var n = bin.length >> 1;
-        if (n === 0) return;
-        var f = new Float32Array(n), sum = 0;
-        for (var i = 0; i < n; i++) {
-            var v = (bin.charCodeAt(2 * i + 1) << 8) | bin.charCodeAt(2 * i);
-            if (v & 0x8000) v -= 0x10000;
-            f[i] = v / 32768;
-            sum += f[i] * f[i];
+        var f, sum = 0, i;
+        if (m.codec === 'adpcm') {
+            f = pluginHandler.deskaudio._adpcmDecode(bin);
+            if (!f || f.length === 0) return;
+            for (i = 0; i < f.length; i++) sum += f[i] * f[i];
+        } else {
+            var n0 = bin.length >> 1;
+            if (n0 === 0) return;
+            f = new Float32Array(n0);
+            for (i = 0; i < n0; i++) {
+                var v = (bin.charCodeAt(2 * i + 1) << 8) | bin.charCodeAt(2 * i);
+                if (v & 0x8000) v -= 0x10000;
+                f[i] = v / 32768;
+                sum += f[i] * f[i];
+            }
         }
+        var n = f.length;
         var ctx = s.ctx, now = ctx.currentTime;
         if (s.next - now > 0.6) return;                      // too far behind real time: drop
         var buf = ctx.createBuffer(1, n, m.rate || 16000);
