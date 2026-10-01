@@ -14,6 +14,7 @@ var mesh = null;
 var child = null;
 var curRate = 16000;
 var curCompress = true;   // ADPCM on by default; false = raw PCM (higher quality, more traffic)
+var curSilence = true;    // suppress pure digital silence; false = always send
 var errBuf = '';
 var lastKeep = 0;
 var watchdog = null;
@@ -115,7 +116,7 @@ function run(path, args) {
     });
     c.stdout.on('data', function (x) {
         if (child !== c) return;
-        if (isSilent(x)) return;   // don't stream pure silence
+        if (curSilence && isSilent(x)) return;   // don't stream pure silence
         if (curCompress) send({ pluginaction: 'chunk', rate: curRate, codec: 'adpcm', d: adpcmEncode(x).toString('base64') });
         else send({ pluginaction: 'chunk', rate: curRate, d: x.toString('base64') });
     });
@@ -238,6 +239,7 @@ function startCapture(a) {
     stopCapture(true);
     curRate = (a.rate == 8000 || a.rate == 16000 || a.rate == 24000) ? a.rate : 16000;
     curCompress = (a.compress !== false);
+    curSilence = (a.silence !== false);
     errBuf = '';
     lastKeep = Date.now();
     if (process.platform == 'linux') return startLinux(a);

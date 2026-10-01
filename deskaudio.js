@@ -14,7 +14,7 @@ module.exports.deskaudio = function (parent) {
     var obj = {};
     obj.parent = parent;
     obj.meshServer = parent.parent;
-    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setCompress', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode'];
+    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setCompress', 'setRate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode'];
 
     var fs = require('fs');
     var path = require('path');
@@ -227,7 +227,8 @@ module.exports.deskaudio = function (parent) {
                 var h;
                 try { h = loadHelpers(); } catch (e) { endStream(nodeid, 'error', 'Не найдены файлы helpers/ плагина'); return; }
                 sendAgent(agent, {
-                    pluginaction: 'start', rate: rate, compress: command.compress !== false, script: h.script,
+                    pluginaction: 'start', rate: rate,
+                    compress: command.compress !== false, silence: command.silence !== false, script: h.script,
                     exe64: h.exe64, ver64: h.ver64, exe32: h.exe32, ver32: h.ver32,
                     source: h.source, ver: h.ver
                 });
@@ -283,29 +284,44 @@ module.exports.deskaudio = function (parent) {
         var s = P._s = P._s || {};
         pluginHandler.registerPluginTab({ tabId: 'pluginDeskAudio', tabTitle: 'Звук' });
         if (s.active && typeof currentNode !== 'undefined' && currentNode && s.nodeid !== currentNode._id) P.stop();
-        var autoOn = false; try { autoOn = (localStorage.getItem('deskaudio_auto') === '1'); } catch (e) { }
+        function pref(k, d) { try { var v = localStorage.getItem('deskaudio_' + k); return (v === null) ? d : v; } catch (e) { return d; } }
+        var H = 'pluginHandler.deskaudio';
         QH('pluginDeskAudio',
-            '<div style="padding:10px;max-width:520px">' +
+            '<div style="padding:10px;max-width:560px">' +
             '<b>Звук рабочего стола</b>' +
             '<p style="opacity:.7;font-size:12px;margin:6px 0">Передаётся то, что воспроизводится на динамики удалённого компьютера. ' +
             'Нужно право «удалённое управление». Действие записывается в журнал событий устройства.</p>' +
-            '<div style="margin:6px 0">Качество: <select id="da_rate">' +
-            '<option value="8000">8 кГц — экономно</option>' +
-            '<option value="16000" selected>16 кГц — речь</option>' +
-            '<option value="24000">24 кГц — лучше</option></select></div>' +
-            '<div style="margin:6px 0"><input type="button" id="da_btn" value="Слушать" onclick="pluginHandler.deskaudio.toggle()"> ' +
-            ' Громкость <input type="range" id="da_vol" min="0" max="100" value="80" oninput="pluginHandler.deskaudio.setVolume(this.value)"></div>' +
-            '<div style="margin:6px 0"><label><input type="checkbox" id="da_auto" onchange="pluginHandler.deskaudio.setAuto(this.checked)"> ' +
-            'Слушать звук при подключении к рабочему столу</label></div>' +
-            '<div style="margin:6px 0"><label><input type="checkbox" id="da_compress" onchange="pluginHandler.deskaudio.setCompress(this.checked)"> ' +
-            'Сжатие звука (экономит трафик; выключите для максимального качества)</label></div>' +
+            '<div style="margin:6px 0"><input type="button" id="da_btn" value="Слушать" onclick="' + H + '.toggle()"> ' +
+            ' Громкость <input type="range" id="da_vol" min="0" max="100" value="80" style="vertical-align:middle" oninput="' + H + '.setVolume(this.value)"></div>' +
             '<div style="height:8px;background:rgba(128,128,128,.25);border-radius:4px;overflow:hidden;margin:6px 0">' +
             '<div id="da_bar" style="height:100%;width:0;background:#4a9;"></div></div>' +
-            '<div id="da_status" style="font-size:12px;opacity:.8"></div></div>');
-        var ac = document.getElementById('da_auto'); if (ac) ac.checked = autoOn;
-        var cc = document.getElementById('da_compress');
-        if (cc) { var cv = '1'; try { var st = localStorage.getItem('deskaudio_compress'); if (st !== null) cv = st; } catch (e) { } cc.checked = (cv !== '0'); }
-        try { var sv = localStorage.getItem('deskaudio_vol'); var vv = document.getElementById('da_vol'); if (sv !== null && vv) vv.value = sv; } catch (e) { }
+            '<div id="da_status" style="font-size:12px;opacity:.8;min-height:16px"></div>' +
+            '<fieldset style="margin:10px 0 0;border:1px solid rgba(128,128,128,.3);border-radius:6px;padding:8px 10px">' +
+            '<legend style="opacity:.7;font-size:12px;padding:0 4px">Настройки</legend>' +
+            '<div style="margin:5px 0">Качество: <select id="da_rate" onchange="' + H + '.setRate(this.value)">' +
+            '<option value="8000">8 кГц — экономно</option>' +
+            '<option value="16000">16 кГц — речь</option>' +
+            '<option value="24000">24 кГц — лучше</option></select>' +
+            ' <span style="opacity:.6;font-size:11px">применится при следующем запуске</span></div>' +
+            '<div style="margin:5px 0"><label><input type="checkbox" id="da_compress" onchange="' + H + '.setCompress(this.checked)"> ' +
+            'Сжатие звука (ADPCM, экономит трафик; выключите для максимального качества)</label></div>' +
+            '<div style="margin:5px 0"><label><input type="checkbox" id="da_silence" onchange="' + H + '.setSilence(this.checked)"> ' +
+            'Не передавать тишину (экономит трафик, когда ничего не играет)</label></div>' +
+            '<div style="margin:5px 0">Буфер / задержка: <select id="da_buffer" onchange="' + H + '.setBuffer(this.value)">' +
+            '<option value="low">Низкий — меньше задержка</option>' +
+            '<option value="med">Средний</option>' +
+            '<option value="high">Высокий — стабильнее при рывках</option></select></div>' +
+            '<div style="margin:5px 0"><label><input type="checkbox" id="da_auto" onchange="' + H + '.setAuto(this.checked)"> ' +
+            'Слушать звук при подключении к рабочему столу</label></div>' +
+            '</fieldset></div>');
+        function setSel(id, val) { var e = document.getElementById(id); if (e) e.value = val; }
+        function setChk(id, on) { var e = document.getElementById(id); if (e) e.checked = on; }
+        setSel('da_rate', pref('rate', '16000'));
+        setSel('da_buffer', pref('buffer', 'med'));
+        setChk('da_compress', pref('compress', '1') !== '0');
+        setChk('da_silence', pref('silence', '1') !== '0');
+        setChk('da_auto', pref('auto', '0') === '1');
+        try { var vv = document.getElementById('da_vol'); var sv = pref('vol', null); if (sv !== null && vv) vv.value = sv; } catch (e) { }
 
         // Button in the Desktop tab's official custom-UI slot (survives version changes).
         var slot = document.getElementById('desktopCustomUiButtons');
@@ -390,9 +406,14 @@ module.exports.deskaudio = function (parent) {
             var Pt = pluginHandler.deskaudio, st2 = Pt._s || {};
             if (st2.active && !st2.gotAudio) { Pt.stop(); st2.statusText = 'Нет ответа от агента'; Pt.render(); }
         }, 10000);
+        function g(k, d) { try { var v = localStorage.getItem('deskaudio_' + k); return (v === null) ? d : v; } catch (e) { return d; } }
         var r = document.getElementById('da_rate');
-        var compress = true; try { compress = (localStorage.getItem('deskaudio_compress') !== '0'); } catch (e) { }
-        meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'start', nodeid: s.nodeid, rate: r ? parseInt(r.value, 10) : 16000, compress: compress });
+        var rate = r ? parseInt(r.value, 10) : parseInt(g('rate', '16000'), 10);
+        var compress = (g('compress', '1') !== '0');
+        var silence = (g('silence', '1') !== '0');
+        var jit = { low: 0.08, med: 0.15, high: 0.30 }[g('buffer', 'med')] || 0.15;
+        s.jitter = jit;
+        meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'start', nodeid: s.nodeid, rate: rate, compress: compress, silence: silence });
         P.render();
     };
 
@@ -418,6 +439,11 @@ module.exports.deskaudio = function (parent) {
     // Remembered per-browser default: compress audio (ADPCM) vs. raw PCM. Takes
     // effect on the next start (stop and start again to switch mid-listen).
     obj.setCompress = function (on) { try { localStorage.setItem('deskaudio_compress', on ? '1' : '0'); } catch (e) { } };
+
+    // More remembered settings (all apply on the next start).
+    obj.setRate = function (v) { try { localStorage.setItem('deskaudio_rate', String(v)); } catch (e) { } };
+    obj.setSilence = function (on) { try { localStorage.setItem('deskaudio_silence', on ? '1' : '0'); } catch (e) { } };
+    obj.setBuffer = function (v) { try { localStorage.setItem('deskaudio_buffer', String(v)); } catch (e) { } };
 
     // Called by MeshCentral when the remote desktop disconnects. Audio is tied to
     // the desktop session, so stop listening whenever the desktop is closed.
@@ -500,14 +526,15 @@ module.exports.deskaudio = function (parent) {
             }
         }
         var n = f.length;
+        var jit = s.jitter || 0.15;                          // jitter buffer from the Буфер setting
         var ctx = s.ctx, now = ctx.currentTime;
-        if (s.next - now > 0.6) return;                      // too far behind real time: drop
+        if (s.next - now > jit * 2 + 0.45) return;           // too far behind real time: drop
         var buf = ctx.createBuffer(1, n, m.rate || 16000);
         buf.copyToChannel(f, 0);
         var src = ctx.createBufferSource();
         src.buffer = buf;
         src.connect(s.gain);
-        if (s.next < now + 0.02) s.next = now + 0.15;        // (re)start with ~150 ms jitter buffer
+        if (s.next < now + 0.02) s.next = now + jit;         // (re)start with the chosen jitter buffer
         src.start(s.next);
         s.next += buf.duration;
         if (!s.gotAudio) { s.gotAudio = true; if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; } s.statusText = 'Идёт передача звука (' + ((m.rate || 16000) / 1000) + ' кГц)'; pluginHandler.deskaudio.render(); }
