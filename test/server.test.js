@@ -279,3 +279,19 @@ test("backpressure drops audio but never status", () => {
     agentMsg(obj, agent, { pluginaction: "status", state: "started" });
     assert.ok(lastStatus(sess.ws), "status still delivered under backpressure");
 });
+
+test("audio from an agent with no listeners tells the agent to stop", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    // No listeners registered (e.g. server restarted while the agent captured).
+    agentMsg(obj, agent, { pluginaction: "chunk", rate: 16000, d: "QUJD" });
+    assert.strictEqual(agent.sent.length, 1, "agent told to stop");
+    assert.strictEqual(agent.sent[0].pluginaction, "stop");
+});
+
+test("a terminal status from an agent with no listeners does not loop a stop", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    agentMsg(obj, agent, { pluginaction: "status", state: "stopped" });
+    assert.strictEqual(agent.sent.length, 0, "no stop sent for an already-stopped agent");
+});

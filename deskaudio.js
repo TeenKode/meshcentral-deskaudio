@@ -225,7 +225,15 @@ module.exports.deskaudio = function (parent) {
     function agentAction(command, agent) {
         var nodeid = agent.dbNodeKey;   // taken from the authenticated agent, never from the message
         var list = listeners[nodeid];
-        if (!list) return;
+        if (!list) {
+            // No listeners (e.g. the server restarted while the agent was still
+            // capturing, or the last listener just left): tell the agent to stop
+            // so it does not keep an orphaned capture running.
+            if (command.pluginaction === 'chunk' || (command.pluginaction === 'status' && command.state !== 'stopped' && command.state !== 'error')) {
+                sendAgent(agent, { pluginaction: 'stop' });
+            }
+            return;
+        }
         switch (command.pluginaction) {
             case 'chunk':
                 if (typeof command.d !== 'string' || command.d.length > 262144) return;
@@ -288,6 +296,19 @@ module.exports.deskaudio = function (parent) {
             slot.appendChild(db);
         }
 
+        // Live "audio is being listened" indicator in the Desktop panel, styled
+        // exactly like MeshCentral's own record indicator (deskRecordIcon) and
+        // placed right next to it. render() shows/hides it with the session.
+        var rec = document.getElementById('deskRecordIcon');
+        if (rec && rec.parentNode && !document.getElementById('da_deskind')) {
+            var ind = document.createElement('div');
+            ind.id = 'da_deskind';
+            ind.className = 'deskareaicon';
+            ind.title = 'Идёт прослушивание звука рабочего стола';
+            ind.style.cssText = 'display:none;background-color:#4a9;width:12px;height:12px;border-radius:6px;margin-top:5px;margin-left:5px';
+            rec.parentNode.insertBefore(ind, rec.nextSibling);
+        }
+
         // Auto-start on desktop connect. MeshCentral has no onDesktopConnect hook,
         // so hook the Connect button; audio runs over its own channel and does not
         // depend on the desktop stream. Stop is handled by onDesktopDisconnect.
@@ -316,6 +337,8 @@ module.exports.deskaudio = function (parent) {
         if (st) st.textContent = s.statusText || '';
         var db = document.getElementById('da_deskbtn');
         if (db) db.value = s.active ? '⏹ Звук' : '🔊 Звук';
+        var ind = document.getElementById('da_deskind');
+        if (ind) ind.style.display = s.active ? '' : 'none';
         if (!s.active) { var bar = document.getElementById('da_bar'); if (bar) bar.style.width = '0'; }
     };
 
@@ -340,7 +363,14 @@ module.exports.deskaudio = function (parent) {
         s.nodeid = currentNode._id;
         s.active = true;
         s.autoStarted = false;   // manual start by default; the auto path sets this true afterwards
+        s.gotAudio = false;
         s.statusText = 'Подключение…';
+        // Don't hang on "Подключение…": if the agent never responds, reset.
+        if (s.connectTimer) { clearTimeout(s.connectTimer); }
+        s.connectTimer = setTimeout(function () {
+            var Pt = pluginHandler.deskaudio, st2 = Pt._s || {};
+            if (st2.active && !st2.gotAudio) { Pt.stop(); st2.statusText = 'Нет ответа от агента'; Pt.render(); }
+        }, 10000);
         var r = document.getElementById('da_rate');
         meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'start', nodeid: s.nodeid, rate: r ? parseInt(r.value, 10) : 16000 });
         P.render();
@@ -349,6 +379,7 @@ module.exports.deskaudio = function (parent) {
     obj.stop = function () {
         var P = pluginHandler.deskaudio;
         var s = P._s = P._s || {};
+        if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }
         if (s.nodeid) meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'stop', nodeid: s.nodeid });
         try { if (s.ctx) s.ctx.close(); } catch (e) { }
         s.ctx = null; s.gain = null; s.active = false; s.autoStarted = false; s.statusText = 'Остановлено';
@@ -375,6 +406,7 @@ module.exports.deskaudio = function (parent) {
         var P = pluginHandler.deskaudio;
         var s = P._s = P._s || {};
         if (!m || m.nodeid !== s.nodeid) return;
+        if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }  // agent responded
         if (m.state === 'started') s.statusText = 'Идёт передача звука' + (m.rate ? ' (' + (m.rate / 1000) + ' кГц)' : '');
         else if (m.state === 'error' || m.state === 'stopped') {
             try { if (s.ctx) s.ctx.close(); } catch (e) { }
@@ -408,7 +440,7 @@ module.exports.deskaudio = function (parent) {
         if (s.next < now + 0.02) s.next = now + 0.15;        // (re)start with ~150 ms jitter buffer
         src.start(s.next);
         s.next += buf.duration;
-        if (!s.gotAudio) { s.gotAudio = true; s.statusText = 'Идёт передача звука (' + ((m.rate || 16000) / 1000) + ' кГц)'; pluginHandler.deskaudio.render(); }
+        if (!s.gotAudio) { s.gotAudio = true; if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; } s.statusText = 'Идёт передача звука (' + ((m.rate || 16000) / 1000) + ' кГц)'; pluginHandler.deskaudio.render(); }
         var bar = document.getElementById('da_bar');
         if (bar) bar.style.width = Math.min(100, Math.round(Math.sqrt(sum / n) * 300)) + '%';
     };

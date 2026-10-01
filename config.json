@@ -1,7 +1,7 @@
 {
   "name": "Desktop Audio",
   "shortName": "deskaudio",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "author": "TeenKode",
   "description": "Listen to the remote computer's desktop audio (what plays through its speakers) in real time, in the browser.",
   "hasAdminPanel": false,
