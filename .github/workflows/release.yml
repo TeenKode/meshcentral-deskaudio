@@ -1,0 +1,55 @@
+name: Release
+
+# Manual release: reads the version from config.json, creates the matching
+# tag (vX.Y.Z) and a GitHub release. Run it from the Actions tab or trigger it
+# via the API. The release is what config.json's versionHistoryUrl reports, so
+# MeshCentral can show the version history and detect updates.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Create the GitHub release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: ${{ inputs.release }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from config.json
+        id: v
+        run: echo "version=$(node -p "require('./config.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Extract changelog notes for this version
+        id: notes
+        run: |
+          ver="${{ steps.v.outputs.version }}"
+          awk -v ver="$ver" '
+            $0 ~ "^## "ver"( |$)" { grab=1; next }
+            grab && /^## / { exit }
+            grab { print }
+          ' changelog.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then echo "Desktop Audio $ver" > RELEASE_NOTES.md; fi
+
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ steps.v.outputs.version }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists, nothing to do."
+            exit 0
+          fi
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Desktop Audio ${{ steps.v.outputs.version }}" \
+            --notes-file RELEASE_NOTES.md \
+            helpers/deskaudio-x64.exe \
+            helpers/deskaudio-x86.exe
