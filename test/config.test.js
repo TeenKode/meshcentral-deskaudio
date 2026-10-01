@@ -33,6 +33,9 @@ test("the files the plugin loads at runtime exist", () => {
         "deskaudio.js",
         "modules_meshcore/deskaudio.js",
         "helpers/win-loopback.cs",
+        "helpers/win-loopback-native.cpp",
+        "helpers/deskaudio-x64.exe",
+        "helpers/deskaudio-x86.exe",
         "helpers/linux-capture.sh"
     ]) {
         assert.ok(fs.existsSync(path.join(DIR, rel)), "missing: " + rel);

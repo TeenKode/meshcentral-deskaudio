@@ -48,7 +48,11 @@ test("first listener with rights starts capture on the agent", () => {
     assert.strictEqual(cmd.pluginaction, "start");
     assert.strictEqual(cmd.rate, 24000);
     assert.ok(typeof cmd.script === "string" && cmd.script.length > 0, "linux helper script included");
-    assert.ok(typeof cmd.source === "string" && cmd.source.length > 0, "windows helper source included");
+    assert.ok(typeof cmd.exe64 === "string" && cmd.exe64.length > 0, "windows x64 native helper included");
+    assert.ok(typeof cmd.exe32 === "string" && cmd.exe32.length > 0, "windows x86 native helper included");
+    assert.ok(typeof cmd.ver64 === "string" && cmd.ver64.length > 0, "x64 helper version hash included");
+    assert.ok(typeof cmd.ver32 === "string" && cmd.ver32.length > 0, "x86 helper version hash included");
+    assert.ok(typeof cmd.source === "string" && cmd.source.length > 0, "windows helper source (fallback) included");
     assert.ok(typeof cmd.ver === "string" && cmd.ver.length > 0, "helper version hash included");
     // Start is logged to the device event log.
     assert.strictEqual(meshServer.events.length, 1);

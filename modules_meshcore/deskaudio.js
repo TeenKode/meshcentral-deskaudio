@@ -2,8 +2,9 @@
  * Desktop Audio plugin — agent side (runs inside the MeshAgent core, Duktape / ES5).
  * Captures desktop audio with a helper process and streams raw PCM chunks to the server.
  *
- *  Linux:   helpers/linux-capture.sh  (parec from PulseAudio/PipeWire, run as the logged-in user)
- *  Windows: helpers/win-loopback.cs   (compiled once with .NET Framework csc.exe, WASAPI loopback)
+ *  Linux:   helpers/linux-capture.sh   (parec from PulseAudio/PipeWire, run as the logged-in user)
+ *  Windows: helpers/deskaudio-x64.exe / deskaudio-x86.exe  (prebuilt native WASAPI loopback,
+ *           no .NET needed), with helpers/win-loopback.cs compiled by csc.exe as a fallback.
  */
 var PLUGIN = 'deskaudio';
 var SPAWN_AS_USER = false;   // Windows: set true to launch the helper inside the logged-in user's session
@@ -69,6 +70,26 @@ function startLinux(a) {
 function startWin(a) {
     var fs = require('fs');
     var tmp = process.env['TEMP'] || process.env['TMP'] || ((process.env['windir'] || 'C:\\Windows') + '\\Temp');
+
+    // 1) Preferred: a prebuilt native helper — no .NET or compiler on the target.
+    //    Use the 64-bit build on a 64-bit OS, the 32-bit build otherwise; the
+    //    32-bit build also runs on 64-bit Windows (WOW64) as a safe default.
+    var os64 = (process.env['PROCESSOR_ARCHITECTURE'] == 'AMD64' ||
+                process.env['PROCESSOR_ARCHITECTURE'] == 'ARM64' ||
+                process.env['PROCESSOR_ARCHITEW6432'] != null);
+    var exeB64 = os64 ? a.exe64 : a.exe32;
+    var exeVer = os64 ? a.ver64 : a.ver32;
+    if (!exeB64) { exeB64 = a.exe32; exeVer = a.ver32; }
+    if (exeB64 && exeVer) {
+        try {
+            var pre = tmp + '\\deskaudio_' + exeVer + '.exe';
+            if (!fs.existsSync(pre)) fs.writeFileSync(pre, Buffer.from(exeB64, 'base64'));
+            if (fs.existsSync(pre)) return run(pre, ['deskaudio.exe', String(curRate)]);
+        } catch (e) { /* fall through to compiling the C# helper */ }
+    }
+
+    // 2) Fallback: compile the C# helper with any csc.exe from the .NET Framework.
+    if (!a.source || !a.ver) return fail('Нет хелпера для Windows');
     var exe = tmp + '\\deskaudio_' + a.ver + '.exe';
     if (fs.existsSync(exe)) return run(exe, ['deskaudio.exe', String(curRate)]);
 

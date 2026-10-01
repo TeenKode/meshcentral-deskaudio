@@ -30,14 +30,23 @@ module.exports.deskaudio = function (parent) {
     // ---------- helpers ----------
     function log(msg) { try { obj.meshServer.debug('deskaudio: ' + msg); } catch (e) { } }
 
+    function md5(buf) { return crypto.createHash('md5').update(buf).digest('hex').substring(0, 8); }
+
     function loadHelpers() {
         if (helperCache) return helperCache;
         var src = fs.readFileSync(path.join(__dirname, 'helpers', 'win-loopback.cs'));
         var sh = fs.readFileSync(path.join(__dirname, 'helpers', 'linux-capture.sh'));
+        var exe64 = fs.readFileSync(path.join(__dirname, 'helpers', 'deskaudio-x64.exe'));
+        var exe32 = fs.readFileSync(path.join(__dirname, 'helpers', 'deskaudio-x86.exe'));
         helperCache = {
-            source: src.toString('base64'),
             script: sh.toString('base64'),
-            ver: crypto.createHash('md5').update(src).digest('hex').substring(0, 8)
+            // Windows: prebuilt native helpers (no .NET required). 32-bit build runs
+            // on 32- and 64-bit Windows; 64-bit build runs natively on x64.
+            exe64: exe64.toString('base64'), ver64: md5(exe64),
+            exe32: exe32.toString('base64'), ver32: md5(exe32),
+            // Fallback if the prebuilt exe can't be dropped: compile the C# helper on
+            // the machine with any csc.exe that ships with the .NET Framework.
+            source: src.toString('base64'), ver: md5(src)
         };
         return helperCache;
     }
@@ -142,7 +151,11 @@ module.exports.deskaudio = function (parent) {
                 if ([8000, 16000, 24000].indexOf(rate) < 0) rate = 16000;
                 var h;
                 try { h = loadHelpers(); } catch (e) { endStream(nodeid, 'error', 'Не найдены файлы helpers/ плагина'); return; }
-                sendAgent(agent, { pluginaction: 'start', rate: rate, script: h.script, source: h.source, ver: h.ver });
+                sendAgent(agent, {
+                    pluginaction: 'start', rate: rate, script: h.script,
+                    exe64: h.exe64, ver64: h.ver64, exe32: h.exe32, ver32: h.ver32,
+                    source: h.source, ver: h.ver
+                });
             } else {
                 sendUser(sess, { method: 'onStatus', nodeid: nodeid, state: 'started' });
             }
