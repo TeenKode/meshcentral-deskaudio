@@ -13,6 +13,7 @@ var KEEPALIVE_TIMEOUT_MS = 60000;
 var mesh = null;
 var child = null;
 var curRate = 16000;
+var curCompress = true;   // ADPCM on by default; false = raw PCM (higher quality, more traffic)
 var errBuf = '';
 var lastKeep = 0;
 var watchdog = null;
@@ -57,6 +58,15 @@ function adpcmEncode(buf) {
     if (nSamp === 0) return alloc ? Buffer.alloc(0) : new Buffer(0);
     function rd(i) { var v = buf[2 * i] | (buf[2 * i + 1] << 8); if (v & 0x8000) v -= 0x10000; return v; }
     var predictor = rd(0), index = 0;
+    // Start the step size matched to the block's dynamics (stored in the header),
+    // so the first samples aren't slew-limited — that per-block "catch-up" is what
+    // causes periodic distortion/noise at every chunk boundary.
+    if (nSamp > 1) {
+        var accd = 0, prev = predictor;
+        for (var k = 1; k < nSamp; k++) { var sk = rd(k), d = sk - prev; if (d < 0) d = -d; accd += d; prev = sk; }
+        var avgd = accd / (nSamp - 1);
+        while (index < 88 && IMA_STEP[index] < avgd) index++;
+    }
     var size = 4 + (nSamp >> 1);
     var out = alloc ? Buffer.alloc(size) : new Buffer(size);
     out[0] = predictor & 0xFF; out[1] = (predictor >> 8) & 0xFF; out[2] = index & 0xFF; out[3] = 0;
@@ -105,7 +115,8 @@ function run(path, args) {
     c.stdout.on('data', function (x) {
         if (child !== c) return;
         if (isSilent(x)) return;   // don't stream pure silence
-        send({ pluginaction: 'chunk', rate: curRate, codec: 'adpcm', d: adpcmEncode(x).toString('base64') });
+        if (curCompress) send({ pluginaction: 'chunk', rate: curRate, codec: 'adpcm', d: adpcmEncode(x).toString('base64') });
+        else send({ pluginaction: 'chunk', rate: curRate, d: x.toString('base64') });
     });
     c.on('exit', function (code) {
         if (child !== c) return;
@@ -225,6 +236,7 @@ function startWin(a) {
 function startCapture(a) {
     stopCapture(true);
     curRate = (a.rate == 8000 || a.rate == 16000 || a.rate == 24000) ? a.rate : 16000;
+    curCompress = (a.compress !== false);
     errBuf = '';
     lastKeep = Date.now();
     if (process.platform == 'linux') return startLinux(a);

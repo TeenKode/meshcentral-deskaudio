@@ -14,7 +14,7 @@ module.exports.deskaudio = function (parent) {
     var obj = {};
     obj.parent = parent;
     obj.meshServer = parent.parent;
-    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode'];
+    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setCompress', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode'];
 
     var fs = require('fs');
     var path = require('path');
@@ -89,11 +89,22 @@ module.exports.deskaudio = function (parent) {
         var h;
         try { h = loadHelpers(); } catch (e) { return; }
         var outDir = mc.datapath || __dirname;
+        var certKey = md5(mc.certificates.codesign.cert);   // changes if the cert changes
 
         [['deskaudio-x64.exe', 'exe64', 'ver64'], ['deskaudio-x86.exe', 'exe32', 'ver32']].forEach(function (f) {
             try {
                 var inPath = path.join(__dirname, 'helpers', f[0]);
-                var outPath = path.join(outDir, 'deskaudio-signed-' + f[0]);
+                // Cache the signed binary by (unsigned-exe hash + cert). Reusing it
+                // keeps the signed bytes — and thus the version hash the agent sees —
+                // stable across server restarts (Authenticode embeds a signing time,
+                // so re-signing every startup would otherwise change the hash).
+                var outPath = path.join(outDir, 'deskaudio-signed-' + h[f[2]] + '-' + certKey + '-' + f[0]);
+                if (fs.existsSync(outPath)) {
+                    var cached = fs.readFileSync(outPath);
+                    h[f[1]] = cached.toString('base64');
+                    h[f[2]] = md5(cached);
+                    return;
+                }
                 var hnd = authenticode.createAuthenticodeHandler(inPath);
                 if (!hnd) return;
                 hnd.sign(certInfo, { hash: 'sha384', out: outPath, desc: 'Desktop Audio helper' }, function (err) {
@@ -216,7 +227,7 @@ module.exports.deskaudio = function (parent) {
                 var h;
                 try { h = loadHelpers(); } catch (e) { endStream(nodeid, 'error', 'Не найдены файлы helpers/ плагина'); return; }
                 sendAgent(agent, {
-                    pluginaction: 'start', rate: rate, script: h.script,
+                    pluginaction: 'start', rate: rate, compress: command.compress !== false, script: h.script,
                     exe64: h.exe64, ver64: h.ver64, exe32: h.exe32, ver32: h.ver32,
                     source: h.source, ver: h.ver
                 });
@@ -286,10 +297,14 @@ module.exports.deskaudio = function (parent) {
             ' Громкость <input type="range" id="da_vol" min="0" max="100" value="80" oninput="pluginHandler.deskaudio.setVolume(this.value)"></div>' +
             '<div style="margin:6px 0"><label><input type="checkbox" id="da_auto" onchange="pluginHandler.deskaudio.setAuto(this.checked)"> ' +
             'Слушать звук при подключении к рабочему столу</label></div>' +
+            '<div style="margin:6px 0"><label><input type="checkbox" id="da_compress" onchange="pluginHandler.deskaudio.setCompress(this.checked)"> ' +
+            'Сжатие звука (экономит трафик; выключите для максимального качества)</label></div>' +
             '<div style="height:8px;background:rgba(128,128,128,.25);border-radius:4px;overflow:hidden;margin:6px 0">' +
             '<div id="da_bar" style="height:100%;width:0;background:#4a9;"></div></div>' +
             '<div id="da_status" style="font-size:12px;opacity:.8"></div></div>');
         var ac = document.getElementById('da_auto'); if (ac) ac.checked = autoOn;
+        var cc = document.getElementById('da_compress');
+        if (cc) { var cv = '1'; try { var st = localStorage.getItem('deskaudio_compress'); if (st !== null) cv = st; } catch (e) { } cc.checked = (cv !== '0'); }
         try { var sv = localStorage.getItem('deskaudio_vol'); var vv = document.getElementById('da_vol'); if (sv !== null && vv) vv.value = sv; } catch (e) { }
 
         // Button in the Desktop tab's official custom-UI slot (survives version changes).
@@ -376,7 +391,8 @@ module.exports.deskaudio = function (parent) {
             if (st2.active && !st2.gotAudio) { Pt.stop(); st2.statusText = 'Нет ответа от агента'; Pt.render(); }
         }, 10000);
         var r = document.getElementById('da_rate');
-        meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'start', nodeid: s.nodeid, rate: r ? parseInt(r.value, 10) : 16000 });
+        var compress = true; try { compress = (localStorage.getItem('deskaudio_compress') !== '0'); } catch (e) { }
+        meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'start', nodeid: s.nodeid, rate: r ? parseInt(r.value, 10) : 16000, compress: compress });
         P.render();
     };
 
@@ -398,6 +414,10 @@ module.exports.deskaudio = function (parent) {
 
     // Remembered per-browser default: auto-listen when connecting to the desktop.
     obj.setAuto = function (on) { try { localStorage.setItem('deskaudio_auto', on ? '1' : '0'); } catch (e) { } };
+
+    // Remembered per-browser default: compress audio (ADPCM) vs. raw PCM. Takes
+    // effect on the next start (stop and start again to switch mid-listen).
+    obj.setCompress = function (on) { try { localStorage.setItem('deskaudio_compress', on ? '1' : '0'); } catch (e) { } };
 
     // Called by MeshCentral when the remote desktop disconnects. Audio is tied to
     // the desktop session, so stop listening whenever the desktop is closed.
