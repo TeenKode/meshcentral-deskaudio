@@ -15,10 +15,11 @@ test("_isSilent detects silence vs. sound in s16le PCM", () => {
     assert.strictEqual(agent._isSilent(Buffer.alloc(0)), true, "empty buffer is silent");
     assert.strictEqual(agent._isSilent(Buffer.alloc(640)), true, "all-zero buffer is silent");
 
-    // Low-level noise under the threshold still counts as silence.
+    // Only pure digital silence is suppressed now: any non-zero sample is audio,
+    // so quiet real audio is never dropped.
     const quiet = Buffer.alloc(640);
-    for (let i = 0; i < quiet.length; i += 2) quiet.writeInt16LE(10, i);
-    assert.strictEqual(agent._isSilent(quiet), true, "sub-threshold noise is silent");
+    quiet.writeInt16LE(3, 10);
+    assert.strictEqual(agent._isSilent(quiet), false, "a tiny non-zero sample is not silence");
 
     // A single loud sample makes the whole buffer non-silent.
     const loud = Buffer.alloc(640);

@@ -26,9 +26,10 @@ function send(o) {
 
 function fail(msg) { send({ pluginaction: 'status', state: 'error', msg: String(msg) }); }
 
-// True if a buffer of s16le PCM is (near-)silence, so the agent can skip
-// streaming it and save bandwidth while nothing plays on the remote machine.
-var SILENCE_THRESHOLD = 48;   // ~ -56 dBFS
+// True only if a buffer of s16le PCM is pure digital silence, so the agent can
+// skip streaming it while nothing plays (Windows WASAPI fills silence with exact
+// zeros). A non-zero threshold would eat quiet real audio, so keep it at 0.
+var SILENCE_THRESHOLD = 0;
 function isSilent(buf) {
     if (!buf || !buf.length) return true;
     for (var i = 0; i + 1 < buf.length; i += 2) {
