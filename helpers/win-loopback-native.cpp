@@ -3,12 +3,8 @@
 //
 // Depends only on system DLLs present on every Windows since Vista/7 (ole32).
 // Cross-compiled from Linux with MinGW-w64, statically linked so the produced
-// .exe needs no MinGW runtime DLLs:
-//
-//   x86_64-w64-mingw32-g++ -O2 -municode -o deskaudio-x64.exe win-loopback-native.cpp \
-//       -static -static-libgcc -static-libstdc++ -lole32 -s
-//   i686-w64-mingw32-g++   -O2 -municode -o deskaudio-x86.exe win-loopback-native.cpp \
-//       -static -static-libgcc -static-libstdc++ -lole32 -s
+// .exe needs no MinGW runtime DLLs. Build with helpers/build-native.sh (CI checks
+// that the committed binaries match this source).
 
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS

@@ -28,6 +28,11 @@ test("version is a plain semver string", () => {
     assert.match(config.version, /^\d+\.\d+\.\d+$/);
 });
 
+test("package.json and config.json carry the same version", () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(DIR, "package.json"), "utf8"));
+    assert.strictEqual(pkg.version, config.version);
+});
+
 test("the files the plugin loads at runtime exist", () => {
     for (const rel of [
         "deskaudio.js",

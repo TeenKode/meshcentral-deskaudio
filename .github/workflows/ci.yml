@@ -16,3 +16,27 @@ jobs:
         with:
           node-version: "20"
       - run: npm test
+
+  # Rebuild the native Windows helpers from source and make sure the committed
+  # binaries are exactly what the source produces (the build is reproducible on
+  # a pinned toolchain).
+  native:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq g++-mingw-w64-x86-64 g++-mingw-w64-i686
+      - name: Build helpers
+        run: sh helpers/build-native.sh
+      - name: Committed helpers match the source
+        run: |
+          if ! git diff --quiet -- helpers/deskaudio-x64.exe helpers/deskaudio-x86.exe; then
+            echo "::error::helpers/*.exe differ from win-loopback-native.cpp — run helpers/build-native.sh on Ubuntu 24.04 and commit the result"
+            exit 1
+          fi
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck helpers/*.sh
