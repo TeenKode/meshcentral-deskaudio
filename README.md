@@ -21,13 +21,18 @@
 Сверено с исходниками MeshCentral 1.2.6 (pluginHandler.js, meshuser.js, meshagent.js, agents/meshcore.js).
 
 1. В `meshcentral-data/config.json`: `"plugins": { "enabled": true }`, перезапустить MeshCentral.
-2. **Вариант A — вручную, без GitHub.** Скопировать папку в `meshcentral-data/plugins/deskaudio/` и добавить
-   в настройки `"plugins": { "enabled": true, "list": ["deskaudio"] }` (режим для локальной разработки: плагин
-   берётся из папки, а не из базы). Перезапустить MeshCentral.
-3. **Вариант B — через интерфейс.** Выложить `config.json` и zip-архив папки на любой веб-сервер (http тоже
-   поддерживается), поправить в `config.json` поля `homepage`, `changelogUrl`, `configUrl`, `downloadUrl`,
-   `repository` (сейчас заглушки `example.invalid`). My Server → Plugins → Download plugin → URL `config.json` →
-   включить плагин. Верхняя папка внутри zip отбрасывается при распаковке, как у архивов GitHub.
+2. **Вариант B — через интерфейс (рекомендуется).** My Server → Plugins → Download plugin → вставить URL
+   `config.json`:
+
+       https://raw.githubusercontent.com/TeenKode/meshcentral-deskaudio/main/config.json
+
+   MeshCentral сам скачает zip репозитория (`downloadUrl`), распакует его, срезав верхнюю папку архива, и
+   положит файлы в `meshcentral-data/plugins/deskaudio/`. Останется включить плагин в списке и обновить
+   страницу. Ничего в `config.json` править не нужно — ссылки уже настроены на этот репозиторий.
+3. **Вариант A — вручную, без GitHub.** Скопировать содержимое репозитория в `meshcentral-data/plugins/deskaudio/`
+   (так, чтобы `config.json` и `deskaudio.js` лежали прямо в этой папке) и добавить в настройки
+   `"plugins": { "enabled": true, "list": ["deskaudio"] }` (режим для локальной разработки: плагин берётся из
+   папки, а не из базы). Перезапустить MeshCentral.
 4. Модуль агента попадает в ядро при старте сервера (`updateMeshCore`). Агентам новое ядро приходит при
    переподключении. Если вкладка работает, а звука нет, обновите ядро принудительно из консоли браузера
    (под администратором):
@@ -54,14 +59,12 @@
 
 ## Структура репозитория
 
-Код плагина лежит в подпапке `deskaudio/` (вместе с `config.json`, `modules_meshcore/` и `helpers/`), а в
-корне репозитория — `package.json` и тесты (`test/`). У большинства плагинов MeshCentral (например
-[MeshCentral-Sample](https://github.com/ryanblenis/MeshCentral-Sample)) `config.json` и `<shortName>.js` лежат
-прямо в корне репозитория. Это важно для установки **через GitHub-архив** (вариант B): MeshCentral при
-распаковке отбрасывает верхнюю папку архива и ожидает `config.json` в корне. Поэтому для варианта B нужно
-выкладывать zip именно **папки `deskaudio/`** (как и написано в разделе «Установка»), а не архив всего репозитория.
-Для ручной установки (вариант A — копирование папки в `meshcentral-data/plugins/deskaudio/`) структура репозитория
-значения не имеет.
+`config.json` и `deskaudio.js` лежат в **корне репозитория** (рядом — `modules_meshcore/`, `helpers/`,
+`changelog.md`), как и у большинства плагинов MeshCentral (например
+[MeshCentral-Sample](https://github.com/ryanblenis/MeshCentral-Sample)). Это нужно для установки через
+интерфейс: MeshCentral скачивает GitHub-архив репозитория, при распаковке отбрасывает верхнюю папку архива
+(`meshcentral-deskaudio-main/`) и ожидает `config.json` сразу под ней. `package.json` и тесты (`test/`) в
+архив тоже попадают, но MeshCentral их игнорирует.
 
 ## Тесты
 

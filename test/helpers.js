@@ -9,7 +9,7 @@
 
 const path = require("path");
 
-const PLUGIN_SERVER = path.join(__dirname, "..", "deskaudio", "deskaudio.js");
+const PLUGIN_SERVER = path.join(__dirname, "..", "deskaudio.js");
 const MESHRIGHT_REMOTECONTROL = 0x00000008;
 
 function makeMeshServer() {

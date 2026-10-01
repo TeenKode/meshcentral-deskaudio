@@ -8,7 +8,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const DIR = path.join(__dirname, "..", "deskaudio");
+const DIR = path.join(__dirname, "..");
 const config = JSON.parse(fs.readFileSync(path.join(DIR, "config.json"), "utf8"));
 
 test("config.json has the fields MeshCentral requires", () => {
