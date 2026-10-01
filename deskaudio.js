@@ -22,6 +22,7 @@ module.exports.deskaudio = function (parent) {
 
     var MESHRIGHT_REMOTECONTROL = 0x00000008;
     var MAX_LISTENERS_PER_NODE = 10;
+    var MAX_TOTAL_STREAMS = 50;   // server-wide cap on simultaneously captured devices
     var KEEPALIVE_MS = 15000;
     var listeners = {};          // nodeid -> [user session objects]
     var keepTimer = null;
@@ -195,6 +196,10 @@ module.exports.deskaudio = function (parent) {
             if (list.indexOf(sess) >= 0) return;
             if (list.length >= MAX_LISTENERS_PER_NODE)
                 return sendUser(sess, { method: 'onStatus', nodeid: nodeid, state: 'error', msg: 'Слишком много слушателей' });
+            // Server-wide cap: a brand-new capture (no existing listeners for this
+            // node) counts against the total number of simultaneous streams.
+            if (!listeners[nodeid] && Object.keys(listeners).length >= MAX_TOTAL_STREAMS)
+                return sendUser(sess, { method: 'onStatus', nodeid: nodeid, state: 'error', msg: 'Сервер: слишком много одновременных аудиопотоков' });
 
             if (!sess._deskaudioHooked && sess.ws) {
                 sess._deskaudioHooked = true;
@@ -285,6 +290,7 @@ module.exports.deskaudio = function (parent) {
             '<div id="da_bar" style="height:100%;width:0;background:#4a9;"></div></div>' +
             '<div id="da_status" style="font-size:12px;opacity:.8"></div></div>');
         var ac = document.getElementById('da_auto'); if (ac) ac.checked = autoOn;
+        try { var sv = localStorage.getItem('deskaudio_vol'); var vv = document.getElementById('da_vol'); if (sv !== null && vv) vv.value = sv; } catch (e) { }
 
         // Button in the Desktop tab's official custom-UI slot (survives version changes).
         var slot = document.getElementById('desktopCustomUiButtons');
@@ -387,6 +393,7 @@ module.exports.deskaudio = function (parent) {
     obj.setVolume = function (val) {
         var s = pluginHandler.deskaudio._s || {};
         if (s.gain) s.gain.gain.value = val / 100;
+        try { localStorage.setItem('deskaudio_vol', String(val)); } catch (e) { }
     };
 
     // Remembered per-browser default: auto-listen when connecting to the desktop.

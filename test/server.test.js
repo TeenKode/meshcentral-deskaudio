@@ -296,3 +296,21 @@ test("a terminal status from an agent with no listeners does not loop a stop", (
     agentMsg(obj, agent, { pluginaction: "status", state: "stopped" });
     assert.strictEqual(agent.sent.length, 0, "no stop sent for an already-stopped agent");
 });
+
+test("a new stream beyond the server-wide cap is rejected", () => {
+    const { obj, meshServer } = loadPlugin();
+    const web = makeWeb();
+    const TOTAL_CAP = 50;   // MAX_TOTAL_STREAMS
+    for (let i = 0; i < TOTAL_CAP; i++) {
+        const nid = "node//s" + i;
+        connectAgent(meshServer, nid);
+        obj.serveraction({ pluginaction: "start", nodeid: nid, rate: 16000 }, makeUserSession({ userid: "u//" + i }), web);
+    }
+    const nid = "node//over";
+    connectAgent(meshServer, nid);
+    const over = makeUserSession({ userid: "u//over" });
+    obj.serveraction({ pluginaction: "start", nodeid: nid, rate: 16000 }, over, web);
+    const st = lastStatus(over.ws);
+    assert.ok(st && st.state === "error");
+    assert.match(st.msg, /слишком много одновременных/i);
+});

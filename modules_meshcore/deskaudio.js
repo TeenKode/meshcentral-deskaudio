@@ -25,6 +25,19 @@ function send(o) {
 
 function fail(msg) { send({ pluginaction: 'status', state: 'error', msg: String(msg) }); }
 
+// True if a buffer of s16le PCM is (near-)silence, so the agent can skip
+// streaming it and save bandwidth while nothing plays on the remote machine.
+var SILENCE_THRESHOLD = 48;   // ~ -56 dBFS
+function isSilent(buf) {
+    if (!buf || !buf.length) return true;
+    for (var i = 0; i + 1 < buf.length; i += 2) {
+        var v = buf[i] | (buf[i + 1] << 8);
+        if (v & 0x8000) v -= 0x10000;
+        if (v > SILENCE_THRESHOLD || v < -SILENCE_THRESHOLD) return false;
+    }
+    return true;
+}
+
 function spawn(path, args) {
     var cpm = require('child_process');
     if (process.platform == 'win32' && SPAWN_AS_USER) return cpm.execFile(path, args, { type: cpm.SpawnTypes.USER });
@@ -48,6 +61,7 @@ function run(path, args) {
     });
     c.stdout.on('data', function (x) {
         if (child !== c) return;
+        if (isSilent(x)) return;   // don't stream pure silence
         send({ pluginaction: 'chunk', rate: curRate, d: x.toString('base64') });
     });
     c.on('exit', function (code) {
@@ -198,4 +212,4 @@ function consoleaction(args, rights, sessionid, parent) {
     }
 }
 
-module.exports = { consoleaction: consoleaction };
+module.exports = { consoleaction: consoleaction, _isSilent: isSilent };
