@@ -18,6 +18,8 @@ var child = null;
 var curRate = 16000;
 var curCompress = true;   // ADPCM on by default; false = raw PCM (higher quality, more traffic)
 var curSilence = true;    // suppress pure digital silence; false = always send
+var curCodec = null;      // 'opus' when the server negotiated Opus with the browser
+var curBitrate = 32;      // Opus bitrate in kbps (24/32/48)
 var curSid = null;        // server session id of the current capture
 var pending = null;       // consent prompt waiting for the local user
 var errBuf = '';
@@ -154,7 +156,8 @@ function feedFramed(x, sid) {
         if (frameRem.got === frameRem.need) {
             var f = frameRem; frameRem = null;
             var msg = { pluginaction: 'chunk', sid: sid, rate: curRate, d: f.buf.toString('base64') };
-            if ((f.flags & 0x02) !== 0) msg.codec = 'adpcm';   // the browser picks its decoder by this
+            if ((f.flags & 0x04) !== 0) msg.codec = 'opus';        // 48 kHz packet; rate says the capture rate
+            else if ((f.flags & 0x02) !== 0) msg.codec = 'adpcm';  // the browser picks its decoder by this
             send(msg);
         }
     }
@@ -186,7 +189,8 @@ function run(path, args, framed) {
         stopWatch();
         send({ pluginaction: 'status', sid: sid, state: (code == 0 ? 'stopped' : 'error'), code: (code == 0 ? 'helper_exit' : 'helper_failed'), exitcode: code, msg: errBuf });
     });
-    send({ pluginaction: 'status', sid: sid, state: 'started', proto: PROTO, rate: curRate });
+    send({ pluginaction: 'status', sid: sid, state: 'started', proto: PROTO, rate: curRate,
+           codec: (curCodec === 'opus') ? 'opus' : (curCompress ? 'adpcm' : 'pcm') });
     startWatch();
 }
 
@@ -195,6 +199,9 @@ function run(path, args, framed) {
 // then executed as root.
 function startLinux(a) {
     if (!a.script) return fail('Нет скрипта захвата для Linux');
+    // Linux captures are raw PCM from parec encoded in JS (ADPCM); there is
+    // no native Opus helper on Linux yet, so an opus request degrades.
+    if (curCodec === 'opus') { curCodec = null; curCompress = true; }
     var script = Buffer.from(a.script, 'base64').toString();
     run('/bin/sh', ['sh', '-c', script, 'deskaudio', String(curRate)]);
 }
@@ -254,7 +261,13 @@ function startWin(a) {
     // A second name is used if the first is locked (e.g. a previous capture is
     // still exiting while a new helper version is dropped).
     var names = ['deskaudio-helper.exe', 'deskaudio-helper-b.exe'];
-    var hargs = ['deskaudio.exe', String(curRate), curCompress ? 'adpcm' : 'pcm'];
+    var hargs = ['deskaudio.exe', String(curRate)];
+    if (curCodec === 'opus') {
+        hargs.push('opus');
+        hargs.push('kbps=' + (curBitrate || 32));
+    } else {
+        hargs.push(curCompress ? 'adpcm' : 'pcm');
+    }
     if (curSilence) hargs.push('silence');
     for (var i = 0; i < names.length; i++) {
         var p = dropFile(fs, dir, names[i], data);
@@ -289,6 +302,8 @@ function startCapture(a) {
     curRate = (a.rate == 8000 || a.rate == 16000 || a.rate == 24000) ? a.rate : 16000;
     curCompress = (a.compress !== false);
     curSilence = (a.silence !== false);
+    curCodec = (a.codec === 'opus') ? 'opus' : null;
+    curBitrate = (a.bitrate == 24 || a.bitrate == 32 || a.bitrate == 48) ? a.bitrate : 32;
     errBuf = '';
     lastKeep = Date.now();
     var c = a.consent || {};

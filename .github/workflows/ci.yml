@@ -26,13 +26,16 @@ jobs:
 
   # Rebuild the native Windows helpers from source and make sure the committed
   # binaries are exactly what the source produces (the build is reproducible on
-  # a pinned toolchain).
+  # a pinned toolchain). libopus (pinned tarball, hash-checked) is downloaded
+  # and built statically first: the helper links it and gains Opus encoding.
   native:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install MinGW-w64
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq g++-mingw-w64-x86-64 g++-mingw-w64-i686
+      - name: Install MinGW-w64 and cmake
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq g++-mingw-w64-x86-64 g++-mingw-w64-i686 cmake
+      - name: Build static libopus (MinGW)
+        run: sh helpers/build-opus.sh
       - name: Build helpers
         run: sh helpers/build-native.sh
       # Uploaded before the match check, so the binaries can be fetched and

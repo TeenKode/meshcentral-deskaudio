@@ -3,8 +3,10 @@
 // Output on stdout is a stream of frames:  [len:2 LE][flags:1][payload].
 //   flags bit0 (0x01) = silence: the payload is empty; the receiver keeps
 //                       the stream continuous but sends nothing over the air
-//   flags bit1 (0x02) = payload is ADPCM (each frame a self-contained block);
-//                       without the bit the payload is raw s16le PCM.
+//   flags bit1 (0x02) = payload is ADPCM (each frame a self-contained block)
+//   flags bit2 (0x04) = payload is an Opus packet (self-contained 20 ms);
+//                       payload layout [dur:2 LE][opus bytes]
+//   flags 0x00        = payload is raw s16le PCM.
 // A frame is emitted at most every FLUSH_MS of audio. Frame boundaries are
 // independent of WASAPI packet boundaries: partial frames are kept back.
 // Arguments:  deskaudio.exe <rate> [adpcm|pcm] [silence]
@@ -35,6 +37,7 @@
 static const int FLUSH_MS = 40;
 
 #include "adpcm-enc.h"
+#include "opus-enc.h"
 
 // True when every sample is exactly zero (WASAPI marks real silence, but the
 // resampler output is what we check — matches the agent's old isSilent()).
@@ -56,16 +59,54 @@ static int fail(const char* msg, HRESULT hr) {
 // capture; the counter resets once a device opens successfully.
 static const int REOPEN_MAX_ATTEMPTS = 10;
 
+#ifdef DA_BUILD_OPUS
+static DaOpusEnc* op = NULL;
+
+// Frame writer for da_opus_feed: [dur:2][opus packet] payload with the
+// opus frame flag. Duration is in 48 kHz samples (the browser sizes its
+// ring push from it).
+static void emit_opus_frame(int len, const unsigned char* pkt, int dur) {
+    unsigned char hdr[3];
+    int payload = 2 + len;
+    hdr[0] = (unsigned char)(payload & 0xFF);
+    hdr[1] = (unsigned char)((payload >> 8) & 0xFF);
+    hdr[2] = 0x04;      // Opus payload
+    fwrite(hdr, 1, 3, stdout);
+    unsigned char d[2];
+    d[0] = (unsigned char)(dur & 0xFF);
+    d[1] = (unsigned char)((dur >> 8) & 0xFF);
+    fwrite(d, 1, 2, stdout);
+    fwrite(pkt, 1, len, stdout);
+    fflush(stdout);
+}
+#endif
+
 int main(int argc, char** argv) {
     int dstRate = (argc > 1) ? atoi(argv[1]) : 16000;
     if (dstRate != 8000 && dstRate != 16000 && dstRate != 24000) dstRate = 16000;
-    // codec: "adpcm" (default) or "pcm"; "silence" to suppress silent frames.
-    bool useAdpcm = true, suppressSilence = false;
+    // codec: "adpcm" (default), "pcm", or "opus" (needs a libopus build);
+    // "silence" to suppress silent frames; "kbps=N" sets the Opus bitrate.
+    bool useAdpcm = true, suppressSilence = false, useOpus = false;
+    int opusBitrate = 32000;
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "pcm") == 0) useAdpcm = false;
-        else if (strcmp(argv[i], "adpcm") == 0) useAdpcm = true;
+        if (strcmp(argv[i], "pcm") == 0) { useAdpcm = false; useOpus = false; }
+        else if (strcmp(argv[i], "adpcm") == 0) { useAdpcm = true; useOpus = false; }
         else if (strcmp(argv[i], "silence") == 0) suppressSilence = true;
+        else if (strncmp(argv[i], "kbps=", 5) == 0) opusBitrate = atoi(argv[i] + 5) * 1000;
+#ifdef DA_BUILD_OPUS
+        else if (strcmp(argv[i], "opus") == 0) { useOpus = true; useAdpcm = false; }
+#endif
     }
+#ifndef DA_BUILD_OPUS
+    (void)useOpus; (void)opusBitrate;   // no libopus linked in: adpcm/pcm only
+#endif
+
+#ifdef DA_BUILD_OPUS
+    if (useOpus) {
+        op = da_opus_init(dstRate, opusBitrate);
+        if (!op) return fail("opus init failed (unsupported rate?)", 0);
+    }
+#endif
 
     // stdout must be binary, otherwise 0x0A bytes get mangled to 0x0D 0x0A.
     _setmode(_fileno(stdout), _O_BINARY);
@@ -190,7 +231,15 @@ int main(int argc, char** argv) {
                 }
                 while (pendLen >= frameSamples) {
                     int silent = allZero(pend, frameSamples);
-                    if (suppressSilence && silent) {
+                    if (useOpus) {
+#ifdef DA_BUILD_OPUS
+                        // 20 ms Opus frames are cut on their own cadence by
+                        // da_opus_feed; this path handles the 40 ms chunking
+                        // by feeding everything through and letting the
+                        // encoder's own buffer split it.
+                        da_opus_feed(op, pend, frameSamples, emit_opus_frame);
+#endif
+                    } else if (suppressSilence && silent) {
                         // keep the frame count honest but send no payload:
                         // a 3-byte frame with the silence flag
                         unsigned char hdr[3];
@@ -239,6 +288,9 @@ int main(int argc, char** argv) {
         Sleep(300);
     }
 
+#ifdef DA_BUILD_OPUS
+    if (op) { da_opus_free(op); op = NULL; }
+#endif
     pEnum->Release();
     CoUninitialize();
     return 0;

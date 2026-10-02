@@ -473,3 +473,45 @@ test("server-generated errors carry a stable code", () => {
     userStart(obj, sess, makeWeb());
     assert.strictEqual(lastStatus(sess.ws).code, "offline");
 });
+
+// ---------- codec negotiation (Opus) ----------
+
+test("browser-listed codecs are honored: opus is offered to the agent", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const sess = makeUserSession();
+    userStart(obj, sess, makeWeb(), { codecs: ["opus", "adpcm", "pcm"], bitrate: 24 });
+    const start = agent.sent.find((m) => m.pluginaction === "start");
+    assert.strictEqual(start.codec, "opus");
+    assert.strictEqual(start.bitrate, 24);
+});
+
+test("without opus in the browser list the agent stays on adpcm", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const sess = makeUserSession();
+    userStart(obj, sess, makeWeb(), { codecs: ["adpcm", "pcm"] });
+    const start = agent.sent.find((m) => m.pluginaction === "start");
+    assert.strictEqual(start.codec, null);
+});
+
+test("the bitrate is clamped to 24/32/48", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const sess = makeUserSession();
+    userStart(obj, sess, makeWeb(), { codecs: ["opus"], bitrate: 99 });
+    const start = agent.sent.find((m) => m.pluginaction === "start");
+    assert.strictEqual(start.bitrate, 32);
+});
+
+test("opus chunks are relayed with their codec field", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const sess = makeUserSession();
+    userStart(obj, sess, makeWeb(), { codecs: ["opus"] });
+    agentMsg(obj, agent, { pluginaction: "status", sid: 1, state: "started", proto: 2, codec: "opus", rate: 16000 });
+    agentMsg(obj, agent, { pluginaction: "chunk", sid: 1, rate: 16000, codec: "opus", d: "AAECAw==" });
+    const chunk = sess.ws.sent.find((m) => m.method === "onChunk");
+    assert.strictEqual(chunk.codec, "opus");
+    assert.strictEqual(chunk.d, "AAECAw==");
+});

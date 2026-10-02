@@ -14,7 +14,7 @@ module.exports.deskaudio = function (parent) {
     var obj = {};
     obj.parent = parent;
     obj.meshServer = parent.parent;
-    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setCompress', 'setRate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_ringNew', '_ringPush'];
+    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setCompress', 'setRate', 'setCodec', 'setBitrate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_ringNew', '_ringPush'];
 
     var fs = require('fs');
     var path = require('path');
@@ -310,9 +310,20 @@ module.exports.deskaudio = function (parent) {
                 consent: consent.prompt || consent.notify, ready: false, rate: rate
             };
             attach(st, sess);
+            // Codec negotiation: the browser lists what it can decode
+            // (WebCodecs AudioDecoder for opus, else adpcm/pcm always work).
+            // The agent confirms what it actually started in its 'started'
+            // status, and every chunk carries its codec, so the browser
+            // always decodes what it receives.
+            var codec = (command.codecs && command.codecs.indexOf('opus') >= 0) ? 'opus' : null;
+            var st2 = streams[nodeid];
+            st2.codec = codec;
+            var bitrate = parseInt(command.bitrate, 10);
+            if ([24, 32, 48].indexOf(bitrate) < 0) bitrate = 32;
             sendAgent(agent, {
                 pluginaction: 'start', sid: st.sid, rate: rate,
                 compress: command.compress !== false, silence: command.silence !== false,
+                codec: codec, bitrate: bitrate,
                 consent: consent, script: h.script,
                 exe64: h.exe64, ver64: h.ver64, exe32: h.exe32, ver32: h.ver32
             });
@@ -340,7 +351,7 @@ module.exports.deskaudio = function (parent) {
                 if (st.consent && !st.ready) return;
                 var rate = parseInt(command.rate, 10);
                 if ([8000, 16000, 24000].indexOf(rate) < 0) return;
-                var codec = (command.codec === 'adpcm') ? 'adpcm' : undefined;
+                var codec = (command.codec === 'adpcm' || command.codec === 'opus') ? command.codec : undefined;
                 st.listeners.forEach(function (s) { sendUser(s, { method: 'onChunk', nodeid: nodeid, rate: rate, codec: codec, d: command.d }); });
                 break;
             case 'status':
@@ -414,6 +425,13 @@ module.exports.deskaudio = function (parent) {
             '<option value="16000">16 кГц — речь</option>' +
             '<option value="24000">24 кГц — лучше</option></select>' +
             ' <span style="opacity:.6;font-size:11px">применится при следующем запуске</span></div>' +
+            '<div style="margin:5px 0">Кодек: <select id="da_codec" onchange="' + H + '.setCodec(this.value)">' +
+            '<option value="auto">Авто (Opus, если браузер умеет)</option>' +
+            '<option value="opus">Opus — лучшее качество</option>' +
+            '<option value="adpcm">ADPCM — совместимость</option>' +
+            '<option value="pcm">PCM без сжатия</option></select>' +
+            ' <span id="da_br" style="opacity:.6;font-size:11px">битрейт: <select id="da_bitrate" onchange="' + H + '.setBitrate(this.value)">' +
+            '<option value="24">24 кбит/с</option><option value="32">32</option><option value="48">48</option></select></span></div>' +
             '<div style="margin:5px 0"><label><input type="checkbox" id="da_compress" onchange="' + H + '.setCompress(this.checked)"> ' +
             'Сжатие звука (ADPCM, экономит трафик; выключите для максимального качества)</label></div>' +
             '<div style="margin:5px 0"><label><input type="checkbox" id="da_silence" onchange="' + H + '.setSilence(this.checked)"> ' +
@@ -428,6 +446,10 @@ module.exports.deskaudio = function (parent) {
         function setSel(id, val) { var e = document.getElementById(id); if (e) e.value = val; }
         function setChk(id, on) { var e = document.getElementById(id); if (e) e.checked = on; }
         setSel('da_rate', pref('rate', '16000'));
+        setSel('da_codec', pref('codec', 'auto'));
+        setSel('da_bitrate', pref('bitrate', '32'));
+        var bri = document.getElementById('da_br');
+        if (bri) bri.style.display = (pref('codec', 'auto') === 'opus') ? '' : 'none';
         setSel('da_buffer', pref('buffer', 'med'));
         setChk('da_compress', pref('compress', '1') !== '0');
         setChk('da_silence', pref('silence', '1') !== '0');
@@ -498,6 +520,30 @@ module.exports.deskaudio = function (parent) {
         if ((P._s || {}).active) P.stop(); else P.start();
     };
 
+    // Which codecs this browser can decode. Opus via WebCodecs AudioDecoder
+    // (probe once and cache; the probe is async, so the first start falls
+    // back to adpcm/pcm and later starts can use opus), plus the always-
+    // available software paths.
+    function probeCodecs() {
+        var P = pluginHandler.deskaudio;
+        var s = P._s = P._s || {};
+        if (s.codecCache) return s.codecCache;
+        var list = ['adpcm', 'pcm'];
+        try {
+            if (typeof AudioDecoder !== 'undefined' && AudioDecoder.isConfigSupported) {
+                AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 })
+                    .then(function (r) {
+                        if (r && r.supported) {
+                            s.codecCache = ['opus', 'adpcm', 'pcm'];
+                            // remember for the next start; the current one
+                            // already went out with adpcm-level support
+                        }
+                    }).catch(function () { });
+            }
+        } catch (e) { }
+        return list;
+    }
+
     obj.start = function () {
         var P = pluginHandler.deskaudio;
         var s = P._s = P._s || {};
@@ -531,7 +577,14 @@ module.exports.deskaudio = function (parent) {
         var silence = (g('silence', '1') !== '0');
         var jit = { low: 0.08, med: 0.15, high: 0.30 }[g('buffer', 'med')] || 0.15;
         s.jitter = jit;
-        meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'start', nodeid: s.nodeid, rate: rate, compress: compress, silence: silence });
+        var pref2 = g('codec', 'auto');
+        var adv = probeCodecs();
+        if (pref2 === 'opus') { adv = ['opus']; }
+        else if (pref2 === 'adpcm') { adv = ['adpcm']; }
+        else if (pref2 === 'pcm') { adv = ['pcm']; }
+        s.codecs = adv;
+        var br = parseInt(g('bitrate', '32'), 10);
+        meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'start', nodeid: s.nodeid, rate: rate, compress: compress, silence: silence, codecs: s.codecs, bitrate: br });
         P.render();
     };
 
@@ -564,6 +617,12 @@ module.exports.deskaudio = function (parent) {
 
     // More remembered settings (all apply on the next start).
     obj.setRate = function (v) { try { localStorage.setItem('deskaudio_rate', String(v)); } catch (e) { } };
+    obj.setCodec = function (v) {
+        try { localStorage.setItem('deskaudio_codec', String(v)); } catch (e) { }
+        var bri = document.getElementById('da_br');
+        if (bri) bri.style.display = (v === 'opus') ? '' : 'none';
+    };
+    obj.setBitrate = function (v) { try { localStorage.setItem('deskaudio_bitrate', String(v)); } catch (e) { } };
     obj.setSilence = function (on) { try { localStorage.setItem('deskaudio_silence', on ? '1' : '0'); } catch (e) { } };
     obj.setBuffer = function (v) { try { localStorage.setItem('deskaudio_buffer', String(v)); } catch (e) { } };
 
@@ -765,6 +824,92 @@ module.exports.deskaudio = function (parent) {
         s.next = 0;
     }
 
+    // Opus decode path: WebCodecs AudioDecoder. The frame payload is
+    // [dur:2 LE][opus packet]; decoded 48 kHz mono PCM goes into the same
+    // worklet ring buffer as ADPCM/PCM (the worklet is rate-agnostic - it
+    // just plays what arrives at the context's rate).
+    function _ensureOpusDecoder(s) {
+        if (s.opusDec || s.opusDecFailed) return s.opusDec;
+        try {
+            if (typeof AudioDecoder === 'undefined') { s.opusDecFailed = true; return null; }
+            s.opusChunks = [];
+            s.opusDec = new AudioDecoder({
+                output: function (frame) {
+                    // f32-planar mono is what our configure() requests; copy
+                    // plane 0 and push it into the ring.
+                    var st = (pluginHandler.deskaudio._s || {});
+                    try {
+                        var plane = new Float32Array(frame.allocationSize({ planeIndex: 0, format: 'f32-planar' }));
+                        frame.copyTo(plane, { planeIndex: 0, format: 'f32-planar' });
+                        _pushDecoded(st, plane, 48000);
+                    } catch (e) { }
+                    try { frame.close(); } catch (e) { }
+                },
+                error: function (e) {
+                    var P = pluginHandler.deskaudio, st = P._s || {};
+                    st.opusDecFailed = true;
+                    try { if (st.opusDec) st.opusDec.close(); } catch (e2) { }
+                    st.opusDec = null;
+                    // The stream keeps flowing: the agent is asked (via the
+                    // next start) to fall back... for now, stop cleanly.
+                    try { P.stop(); } catch (e2) { }
+                }
+            });
+            s.opusDec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+        } catch (e) { s.opusDecFailed = true; return null; }
+        return s.opusDec;
+    }
+
+    // Decoded PCM from any codec goes to the worklet ring (or the fallback
+    // scheduler) at its own rate.
+    function _pushDecoded(s, f32, rate) {
+        var sum = 0;
+        for (var i = 0; i < f32.length; i++) sum += f32[i] * f32[i];
+        if (!s.gotAudio) {
+            s.gotAudio = true;
+            if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }
+            s.statusText = 'Идёт передача звука (Opus 48 кГц)';
+            pluginHandler.deskaudio.render();
+        }
+        if (s.workletReady && s.node) {
+            var cp = Float32Array.from(f32);
+            s.node.port.postMessage({ cmd: 'push', s: cp }, [cp.buffer]);
+        } else if (s.ctx.audioWorklet && s.pending !== null) {
+            if (!s.pending) s.pending = [];
+            s.pending.push(f32);
+        } else {
+            var jit = s.jitter || 0.15;
+            var ctx = s.ctx, now = ctx.currentTime;
+            if (s.next - now > jit * 2 + 0.45) return;
+            var buf = ctx.createBuffer(1, f32.length, rate);
+            buf.copyToChannel(f32, 0);
+            var src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(s.gain);
+            if (s.next < now + 0.02) s.next = now + jit;
+            src.start(s.next);
+            s.next += buf.duration;
+        }
+        var bar = document.getElementById('da_bar');
+        if (bar) bar.style.width = Math.min(100, Math.round(Math.sqrt(sum / f32.length) * 300)) + '%';
+    }
+
+    // One opus chunk from the agent: [dur:2][packet] -> AudioDecoder.
+    function _opusChunk(s, bin) {
+        var dec = _ensureOpusDecoder(s);
+        if (!dec) return;                       // unsupported: no audio, but no crash
+        if (bin.length < 2) return;
+        var dur = bin.charCodeAt(0) | (bin.charCodeAt(1) << 8);
+        var pkt = bin.substring(2);
+        if (dur <= 0 || pkt.length === 0) return;
+        var u8 = new Uint8Array(pkt.length);
+        for (var i = 0; i < pkt.length; i++) u8[i] = pkt.charCodeAt(i) & 0xFF;
+        try {
+            dec.decode(new AudioData({ format: 'opus', sampleRate: 48000, numberOfFrames: dur,
+                                       numberOfChannels: 1, timestamp: 0, data: u8 }));
+        } catch (e) { }
+    }
+
     obj.onChunk = function (a, b) {
         var m = (b !== undefined && b !== null) ? b : a;
         var s = (pluginHandler.deskaudio._s || {});
@@ -774,6 +919,7 @@ module.exports.deskaudio = function (parent) {
         if (!s.ctx) return;
         var bin = atob(m.d);
         var f, sum = 0, i;
+        if (m.codec === 'opus') { _opusChunk(s, bin); return; }
         if (m.codec === 'adpcm') {
             f = pluginHandler.deskaudio._adpcmDecode(bin);
             if (!f || f.length === 0) return;
