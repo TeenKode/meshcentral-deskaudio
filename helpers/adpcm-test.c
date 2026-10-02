@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
                  + (double)((int)(lcg() % 400) - 200);                    /* +noise */
         if (v > 32767.0) v = 32767.0;
         if (v < -32768.0) v = -32768.0;
-        in[i] = (short)lrint(v);   /* Math.round in the JS fixture generator */
+        in[i] = (short)floor(v + 0.5);   /* JS Math.round rounds half up, not to even */
     }
 
     int block = 640;                     /* one 40 ms frame at 16 kHz */
