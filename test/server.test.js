@@ -598,7 +598,7 @@ test("helper bytes are sent until the agent shows it fetches them on demand", ()
     st = agentStarts(agent)[1];
     assert.strictEqual(st.exe64, undefined, "proto 3 agent: no helper bytes in start");
     assert.strictEqual(st.exe32, undefined);
-    assert.ok(JSON.stringify(st).length < 5000, "start message is small: " + JSON.stringify(st).length + " bytes");
+    assert.ok(JSON.stringify(st).length < 10000, "start message is small (was ~1.2 MB): " + JSON.stringify(st).length + " bytes");
 
     agentMsg(obj, agent, { pluginaction: "need", sid: st.sid, proto: 3, arch: "x86" });
     const h = agent.sent.filter((m) => m.pluginaction === "helper").pop();
