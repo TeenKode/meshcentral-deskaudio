@@ -1,4 +1,4 @@
-// Test input for test/e2e/opus-playback.js: encode 4 s of a continuous two-tone
+// Test input for e2e/opus-playback.js: encode 4 s of a continuous two-tone
 // signal into 20 ms Opus packets (as the helper does), written as
 // [dur:2 LE][len:2 LE][packet] records (dur in 48 kHz samples).
 #include <opus/opus.h>

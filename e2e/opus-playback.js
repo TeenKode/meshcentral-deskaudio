@@ -5,16 +5,16 @@
 // or a wrong level. Mocks cannot catch this class of bug (e.g. reading
 // AudioData.allocationSize() as samples instead of bytes).
 //
-//   cc -O2 -o /tmp/opus-packets test/e2e/opus-packets.c -lopus -lm
+//   cc -O2 -o /tmp/opus-packets e2e/opus-packets.c -lopus -lm
 //   /tmp/opus-packets > /tmp/packets.bin
-//   node test/e2e/opus-playback.js /tmp/packets.bin opus2
+//   node e2e/opus-playback.js /tmp/packets.bin opus2
 // (needs the playwright package and its chromium)
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { chromium } = require("playwright");
 
-const pluginPath = path.join(__dirname, "..", "..", "deskaudio.js");
+const pluginPath = path.join(__dirname, "..", "deskaudio.js");
 const packetsPath = process.argv[2];
 const mode = process.argv[3] || "opus2";
 const obj = require(pluginPath).deskaudio({ parent: { webserver: {} } });
