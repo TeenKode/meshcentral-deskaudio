@@ -248,6 +248,23 @@ describe("agent (Windows)", { skip: !isWin ? "windows-only: runs on the windows 
         });
     });
 
+    test("spawnAsUser from the server launches the helper in the user's session", () => {
+        withWinAgent(({ ag, calls, parent }) => {
+            const real = cp.SpawnTypes;
+            cp.SpawnTypes = { USER: 2 };
+            const realExec = cp.execFile;
+            let opts = null;
+            cp.execFile = (file, args, o) => { opts = o; return realExec(file, args); };
+            try {
+                startAct(ag, parent, { spawnAsUser: true });
+                assert.deepStrictEqual(opts, { type: 2 });
+                cp.execFile = (file, args, o) => { opts = o; return realExec(file, args); };
+                startAct(ag, parent, { sid: 2 });
+                assert.strictEqual(opts, undefined, "default: the agent's own session");
+            } finally { cp.SpawnTypes = real; cp.execFile = realExec; }
+        });
+    });
+
     // ---- dropFile itself is platform-independent; keep it here so the
     // Windows runner exercises the exact helper-drop code path. ----
     test("dropFile writes the helper, reuses an identical file, replaces a planted one", () => {

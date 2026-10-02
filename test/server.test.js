@@ -621,3 +621,74 @@ test("a reconnected agent (new connection) is sent the bytes again", () => {
     userStart(obj, sess, web);
     assert.ok(agentStarts(agent)[0].exe64, "unknown again: full bytes");
 });
+
+// ---------- settings from MeshCentral's config.json ----------
+
+function withSettings(meshServer, d) { meshServer.config.settings = { plugins: { enabled: true, deskaudio: d } }; }
+
+test("listener and stream limits come from config.json (keys are lower-cased by MeshCentral)", () => {
+    const { obj, meshServer } = loadPlugin();
+    withSettings(meshServer, { maxlistenerspernode: 2, maxstreams: 1 });
+    connectAgent(meshServer, NODE);
+    const web = makeWeb();
+    userStart(obj, makeUserSession({ userid: "u//1" }), web);
+    userStart(obj, makeUserSession({ userid: "u//2" }), web);
+    const third = makeUserSession({ userid: "u//3" });
+    userStart(obj, third, web);
+    assert.strictEqual(lastStatus(third.ws).code, "too_many_listeners");
+
+    connectAgent(meshServer, "node//pc2");
+    const other = makeUserSession({ userid: "u//4" });
+    obj.serveraction({ pluginaction: "start", nodeid: "node//pc2" }, other, web);
+    assert.strictEqual(lastStatus(other.ws).code, "too_many_streams");
+});
+
+test("invalid limits fall back to the defaults", () => {
+    const { obj, meshServer } = loadPlugin();
+    withSettings(meshServer, { maxListenersPerNode: "lots", maxStreams: -5 });
+    connectAgent(meshServer, NODE);
+    const web = makeWeb();
+    for (let i = 0; i < 10; i++) userStart(obj, makeUserSession({ userid: "u//" + i }), web);
+    const over = makeUserSession({ userid: "u//over" });
+    userStart(obj, over, web);
+    assert.strictEqual(lastStatus(over.ws).code, "too_many_listeners", "default cap of 10 applies");
+});
+
+test("spawnAsUser and custom consent texts are passed to the agent", () => {
+    const { obj, meshServer } = loadPlugin();
+    withSettings(meshServer, { spawnAsUser: true, consentMessage: "Можно послушать, {0}?" });
+    const agent = connectAgent(meshServer, NODE);
+    const sess = makeUserSession({ name: "bob" });
+    userStart(obj, sess, consentWeb(8));
+    const st = agentStarts(agent)[0];
+    assert.strictEqual(st.spawnAsUser, true);
+    assert.strictEqual(st.consent.msg, "Можно послушать, bob?");
+});
+
+test("the end of listening is logged with its duration", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = makeWeb();
+    const a = makeUserSession({ userid: "user//a" });
+    const b = makeUserSession({ userid: "user//b" });
+    const realNow = Date.now;
+    try {
+        Date.now = () => 1000000;
+        userStart(obj, a, web);
+        userStart(obj, b, web);
+        Date.now = () => 1000000 + 125000;          // 2 min 5 s later
+        userStop(obj, a, web);
+        let ends = meshServer.events.filter((e) => /конец/.test(e.msg));
+        assert.strictEqual(ends.length, 1);
+        assert.strictEqual(ends[0].userid, "user//a");
+        assert.match(ends[0].msg, /конец, 2 мин 5 с$/);
+
+        const sid = agent.sent.find((m) => m.pluginaction === "start").sid;
+        agentMsg(obj, agent, { pluginaction: "status", sid, state: "error", code: "helper_failed", msg: "boom" });
+        ends = meshServer.events.filter((e) => /конец/.test(e.msg));
+        assert.strictEqual(ends.length, 2, "a stream ended by the agent is logged for the remaining listener");
+        assert.match(ends[1].msg, /\(boom\)$/);
+        userStop(obj, b, web);
+        assert.strictEqual(meshServer.events.filter((e) => /конец/.test(e.msg)).length, 2, "never logged twice");
+    } finally { Date.now = realNow; }
+});

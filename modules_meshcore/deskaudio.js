@@ -10,7 +10,10 @@
  * every status and chunk so the server can ignore messages from an earlier one.
  */
 var PLUGIN = 'deskaudio';
-var SPAWN_AS_USER = false;   // Windows: set true to launch the helper inside the logged-in user's session
+// Windows: launch the helper inside the logged-in user's session instead of
+// the agent's (session 0). Set per start by the server from config.json
+// (settings.plugins.deskaudio.spawnAsUser); false by default.
+var SPAWN_AS_USER = false;
 var KEEPALIVE_TIMEOUT_MS = 60000;
 
 var mesh = null;
@@ -372,6 +375,7 @@ function startCapture(a) {
     curRate = (a.rate == 8000 || a.rate == 16000 || a.rate == 24000) ? a.rate : 16000;
     curCompress = (a.compress !== false);
     curSilence = (a.silence !== false);
+    SPAWN_AS_USER = (a.spawnAsUser === true);
     curCodec = (a.codec === 'opus') ? 'opus' : null;
     curBitrate = (a.bitrate == 24 || a.bitrate == 32 || a.bitrate == 48) ? a.bitrate : 32;
     errBuf = '';

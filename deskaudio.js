@@ -26,6 +26,26 @@ module.exports.deskaudio = function (parent) {
     var USERCONSENT_DesktopPromptUser = 8;
     var MAX_LISTENERS_PER_NODE = 10;
     var MAX_TOTAL_STREAMS = 50;   // server-wide cap on simultaneously captured devices
+
+    // Optional settings in MeshCentral's config.json:
+    //   "settings": { "plugins": { "enabled": true,
+    //     "deskaudio": { "maxListenersPerNode": 10, "maxStreams": 50, "spawnAsUser": false,
+    //                    "consentMessage": "...{0}...", "notifyMessage": "...{0}..." } } }
+    // MeshCentral lower-cases config keys on load, so keys are matched
+    // case-insensitively. Read on every use: no restart needed after a reload.
+    function settings() {
+        var out = {};
+        try {
+            var p = obj.meshServer.config.settings.plugins, d = null;
+            for (var k in p) if (k.toLowerCase() === 'deskaudio') d = p[k];
+            if (d && typeof d === 'object') for (var j in d) out[j.toLowerCase()] = d[j];
+        } catch (e) { }
+        return out;
+    }
+    function intSetting(v, def, min, max) {
+        v = parseInt(v, 10);
+        return (isNaN(v) || v < min || v > max) ? def : v;
+    }
     var KEEPALIVE_MS = 15000;
     var DEFAULT_CONSENT_MSG = 'Пользователь {0} запрашивает прослушивание звука этого компьютера. Разрешить?';
     var DEFAULT_NOTIFY_MSG = 'Пользователь {0} слушает звук этого компьютера.';
@@ -208,13 +228,14 @@ module.exports.deskaudio = function (parent) {
         var st = streams[nodeid];
         delete streams[nodeid];
         if (!st) return;
-        st.listeners.forEach(function (s) { sendStatus(s, nodeid, state, code, msg); });
+        st.listeners.forEach(function (s) { logEnd(st, s, msg || code); sendStatus(s, nodeid, state, code, msg); });
         Object.keys(st.pending).forEach(function (r) { sendStatus(st.pending[r], nodeid, state, code, msg); });
     }
 
     function removeListener(nodeid, sess) {
         var st = streams[nodeid];
         if (!st) return;
+        logEnd(st, sess);
         st.listeners = st.listeners.filter(function (s) { return s !== sess; });
         Object.keys(st.pending).forEach(function (r) { if (st.pending[r] === sess) delete st.pending[r]; });
         if (st.listeners.length > 0 || Object.keys(st.pending).length > 0) return;
@@ -243,12 +264,15 @@ module.exports.deskaudio = function (parent) {
     function consentInfo(flags, domain, user) {
         var cm = (domain && typeof domain.consentmessages === 'object' && domain.consentmessages) || {};
         var who = user.realname || user.name;
+        var cfg = settings();
+        var cmsg = (typeof cfg.consentmessage === 'string' && cfg.consentmessage) ? cfg.consentmessage : DEFAULT_CONSENT_MSG;
+        var nmsg = (typeof cfg.notifymessage === 'string' && cfg.notifymessage) ? cfg.notifymessage : DEFAULT_NOTIFY_MSG;
         return {
             prompt: (flags & USERCONSENT_DesktopPromptUser) !== 0,
             notify: (flags & USERCONSENT_DesktopNotifyUser) !== 0,
             title: (typeof cm.title === 'string') ? cm.title : 'MeshCentral',
-            msg: DEFAULT_CONSENT_MSG.replace(/\{0\}/g, who),
-            notifyMsg: DEFAULT_NOTIFY_MSG.replace(/\{0\}/g, who),
+            msg: cmsg.replace(/\{0\}/g, who),
+            notifyMsg: nmsg.replace(/\{0\}/g, who),
             timeout: (typeof cm.consenttimeout === 'number' && cm.consenttimeout > 0) ? cm.consenttimeout : 30,
             autoAcceptNoUser: cm.autoacceptifdesktopnouser === true
         };
@@ -257,6 +281,17 @@ module.exports.deskaudio = function (parent) {
     function attach(st, sess) {
         st.listeners.push(sess);
         st.users[sess.user._id] = true;
+        st.since.set(sess, Date.now());
+    }
+
+    // Device event log: the end of a listener's session, with its duration.
+    function logEnd(st, sess, why) {
+        var t0 = st.since.get(sess);
+        if (t0 === undefined) return;
+        st.since.delete(sess);
+        var sec = Math.round((Date.now() - t0) / 1000);
+        var dur = (sec >= 60 ? Math.floor(sec / 60) + ' мин ' : '') + (sec % 60) + ' с';
+        logEvent(sess, st.node, 'Прослушивание звука рабочего стола: конец, ' + dur + (why ? ' (' + why + ')' : ''));
     }
 
     // ---------- user (browser) -> server ----------
@@ -282,11 +317,12 @@ module.exports.deskaudio = function (parent) {
 
             var st = streams[nodeid];
             if (st && (st.listeners.indexOf(sess) >= 0 || Object.keys(st.pending).some(function (r) { return st.pending[r] === sess; }))) return;
-            if (st && st.listeners.length + Object.keys(st.pending).length >= MAX_LISTENERS_PER_NODE)
+            var cfg = settings();
+            if (st && st.listeners.length + Object.keys(st.pending).length >= intSetting(cfg.maxlistenerspernode, MAX_LISTENERS_PER_NODE, 1, 100))
                 return sendStatus(sess, nodeid, 'error', 'too_many_listeners', 'Слишком много слушателей');
             // Server-wide cap: a brand-new capture counts against the total number
             // of simultaneous streams.
-            if (!st && Object.keys(streams).length >= MAX_TOTAL_STREAMS)
+            if (!st && Object.keys(streams).length >= intSetting(cfg.maxstreams, MAX_TOTAL_STREAMS, 1, 10000))
                 return sendStatus(sess, nodeid, 'error', 'too_many_streams', 'Сервер: слишком много одновременных аудиопотоков');
 
             if (!ss.hooked && sess.ws) {
@@ -320,7 +356,8 @@ module.exports.deskaudio = function (parent) {
             var h;
             try { h = loadHelpers(); } catch (e) { return sendStatus(sess, nodeid, 'error', 'no_helpers', 'Не найдены файлы helpers/ плагина'); }
             st = streams[nodeid] = {
-                sid: nextSid++, listeners: [], users: {}, pending: {},
+                sid: nextSid++, listeners: [], users: {}, pending: {}, since: new Map(),
+                node: { _id: node._id, meshid: node.meshid, domain: node.domain },
                 // With consent required, no audio is relayed until the agent
                 // confirms (in 'started') that it understood the consent request.
                 consent: consent.prompt || consent.notify, ready: false, rate: rate
@@ -341,7 +378,7 @@ module.exports.deskaudio = function (parent) {
                 pluginaction: 'start', sid: st.sid, rate: rate,
                 compress: compress, silence: command.silence !== false,
                 codec: st.codec, bitrate: bitrate,
-                consent: consent, script: h.script,
+                consent: consent, script: h.script, spawnAsUser: settings().spawnasuser === true,
                 helper: { x64: { sha: h.sha64, size: h.size64 }, x86: { sha: h.sha32, size: h.size32 } }
             };
             // An agent not yet known to fetch helpers on demand gets the bytes.
