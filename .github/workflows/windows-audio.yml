@@ -1,0 +1,75 @@
+name: Windows audio capture
+
+# Real WASAPI loopback capture with the shipped helpers on a Windows runner.
+# The runner has no sound card, so a virtual one (VB-CABLE) is installed; a
+# test tone (440 Hz + 1000 Hz) is played to the default output and captured in
+# PCM / ADPCM / Opus, x64 and x86. Opus is decoded with libopus on Linux.
+# Runs when the helpers or these checks change, or by hand.
+on:
+  push:
+    paths:
+      - "helpers/**"
+      - "e2e/**"
+      - ".github/workflows/windows-audio.yml"
+  pull_request:
+    paths:
+      - "helpers/**"
+      - "e2e/**"
+      - ".github/workflows/windows-audio.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install a virtual sound card (VB-CABLE)
+        uses: LABSN/sound-ci-helpers@e9d6ba52163a3283714a68412036ddf33f78d49c
+      - name: Start the Windows audio service
+        shell: pwsh
+        run: |
+          foreach ($s in "AudioEndpointBuilder", "Audiosrv") {
+            Set-Service -Name $s -StartupType Automatic
+            Start-Service -Name $s
+          }
+          Get-Service AudioEndpointBuilder, Audiosrv | Format-Table -AutoSize
+          Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | Format-Table -AutoSize
+      - name: Capture the test tone with the real helpers
+        run: node e2e/win-capture.js capture-out
+      - name: Keep the Opus captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-opus-captures
+          path: capture-out/capture-opus-*.bin
+          if-no-files-found: warn
+
+  # The Opus streams captured on Windows, decoded with libopus and checked for
+  # the tone the same way as PCM/ADPCM.
+  opus-content:
+    needs: capture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install libopus
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-opus-captures
+          path: cap
+      - name: Decode and check
+        run: |
+          cc -O2 -Wall -o /tmp/opus-decode e2e/opus-decode.c -lopus
+          for f in cap/capture-opus-*.bin; do
+            /tmp/opus-decode "$f" > "$f.raw"
+            node e2e/check-pcm.js "$f.raw" 48000 "$(basename "$f" .bin)"
+          done
