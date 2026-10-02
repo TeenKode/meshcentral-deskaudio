@@ -20,9 +20,11 @@ const FIXTURE = path.join(__dirname, "fixtures", "native-adpcm.hex");
 
 // The same deterministic integer signal as helpers/adpcm-test.c (LCG, no
 // floating point anywhere, so both sides agree bit for bit by construction).
+// NB: Math.imul for the LCG step: seed * 1103515245 exceeds 2^53 for large
+// seeds, where double arithmetic loses bits that a 32-bit int keeps.
 function makeSignal() {
     let seed = 12345;
-    const lcg = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed; };
+    const lcg = () => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return seed & 0x7fffffff; };
     const N = 2000, BLOCK = 640;
     const blocks = [];
     let cur = [];
