@@ -30,10 +30,11 @@ int main(int argc, char** argv) {
     short in[N];
     for (int i = 0; i < N; i++) {
         double t = (double)i;
-        double v = 12000.0 * sin(2.0 * 3.14159265358979 * t / 32.0)      /* tone */
-                 + 4000.0 * sin(2.0 * 3.14159265358979 * t / 7.0)        /* +harmonic */
+        double v = 12000.0 * sin(2.0 * 3.14159265358979323846 * t / 32.0)      /* tone */
+                 + 4000.0 * sin(2.0 * 3.14159265358979323846 * t / 7.0)        /* +harmonic */
                  + (double)((int)(lcg() % 400) - 200);                    /* +noise */
-        if (v > 32767.0) v = 32767.0; if (v < -32768.0) v = -32768.0;
+        if (v > 32767.0) v = 32767.0;
+        if (v < -32768.0) v = -32768.0;
         in[i] = (short)lrint(v);   /* Math.round in the JS fixture generator */
     }
 
