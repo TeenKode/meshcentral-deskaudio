@@ -14,7 +14,7 @@ module.exports.deskaudio = function (parent) {
     var obj = {};
     obj.parent = parent;
     obj.meshServer = parent.parent;
-    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setCompress', 'setRate', 'setCodec', 'setBitrate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_ringNew', '_ringPush'];
+    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setCompress', 'setRate', 'setCodec', 'setBitrate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_ringNew', '_ringPush', 'probeCodecs', '_ensureCtx', '_ensureOpusDecoder', '_pushDecoded', '_opusChunk'];
 
     var fs = require('fs');
     var path = require('path');
@@ -524,7 +524,7 @@ module.exports.deskaudio = function (parent) {
     // (probe once and cache; the probe is async, so the first start falls
     // back to adpcm/pcm and later starts can use opus), plus the always-
     // available software paths.
-    function probeCodecs() {
+    obj.probeCodecs = function () {
         var P = pluginHandler.deskaudio;
         var s = P._s = P._s || {};
         if (s.codecCache) return s.codecCache;
@@ -578,7 +578,7 @@ module.exports.deskaudio = function (parent) {
         var jit = { low: 0.08, med: 0.15, high: 0.30 }[g('buffer', 'med')] || 0.15;
         s.jitter = jit;
         var pref2 = g('codec', 'auto');
-        var adv = probeCodecs();
+        var adv = P.probeCodecs();
         if (pref2 === 'opus') { adv = ['opus']; }
         else if (pref2 === 'adpcm') { adv = ['adpcm']; }
         else if (pref2 === 'pcm') { adv = ['pcm']; }
@@ -657,43 +657,6 @@ module.exports.deskaudio = function (parent) {
         P.render();
     };
 
-    // ---- AudioWorklet (click-free playback + drift handling) ----
-    // The worklet pulls from a ring buffer shared via messages: chunks are
-    // posted into it, the audio thread drains 128-sample frames. This keeps
-    // chunk boundaries seamless (no per-chunk BufferSource scheduling) and
-    // absorbs clock drift between the agent and the browser.
-    var WORKLET_SRC =
-        "class DeskAudioProcessor extends AudioWorkletProcessor {" +
-        "  constructor() {" +
-        "    super();" +
-        "    this.ring = new Float32Array(RCAP);" +
-        "    this.r = 0; this.w = 0; this.used = 0; this.last = 0; this.fill = 0;" +
-        "    this.port.onmessage = (e) => {" +
-        "      const d = e.data;" +
-        "      if (d.cmd === 'push') { const s = d.s;" +
-        "        for (let i = 0; i < s.length; i++) {" +
-        "          if (this.used === RCAP) { this.r = (this.r + 1) % RCAP; this.used--; }" +
-        "          this.ring[this.w] = s[i]; this.w = (this.w + 1) % RCAP; this.used++;" +
-        "        }" +
-        "        this.fill = this.used / RCAP;" +
-        "        this.port.postMessage({ fill: this.fill });" +
-        "      }" +
-        "    };" +
-        "  }" +
-        "  process(inputs, outputs) {" +
-        "    const out = outputs[0][0];" +
-        "    for (let i = 0; i < out.length; i++) {" +
-        "      if (this.used > 0) {" +
-        "        out[i] = this.ring[this.r]; this.last = out[i];" +
-        "        this.r = (this.r + 1) % RCAP; this.used--;" +
-        "      } else { out[i] = this.last; }" +
-        "    }" +
-        "    this.fill = this.used / RCAP;" +
-        "    return true;" +
-        "  }" +
-        "}" +
-        "registerProcessor('deskaudio-processor', DeskAudioProcessor);";
-
     // ---- Ring buffer (pure functions; the worklet mirrors this logic) ----
     // One producer (network chunks) and one consumer (the audio thread) at a
     // fixed sample rate. `buf` is a Float32Array used as a circular queue.
@@ -768,8 +731,9 @@ module.exports.deskaudio = function (parent) {
 
     // Create the AudioContext at the agent's actual rate on the first chunk,
     // then wire up the worklet (or the fallback scheduler). The rate is known
-    // only here, not in start().
-    function _ensureCtx(s, rate) {
+    // only here, not in start(). Exported: serialized browser code (onChunk)
+    // calls it via pluginHandler.deskaudio._ensureCtx.
+    obj._ensureCtx = function (s, rate) {
         if (s.ctx) return;
         var AC = window.AudioContext || window.webkitAudioContext;
         if (!AC) return;
@@ -795,7 +759,36 @@ module.exports.deskaudio = function (parent) {
         // clock-drift absorption. Blob URL because the plugin cannot serve
         // its own files.
         var cap = Math.max(128, Math.round((s.jitter || 0.15) * rate * 4));   // ~4x the jitter buffer
-        var code = WORKLET_SRC.replace(/RCAP/g, String(cap));
+        var code = ("class DeskAudioProcessor extends AudioWorkletProcessor {" +
+        "  constructor() {" +
+        "    super();" +
+        "    this.ring = new Float32Array(RCAP);" +
+        "    this.r = 0; this.w = 0; this.used = 0; this.last = 0; this.fill = 0;" +
+        "    this.port.onmessage = (e) => {" +
+        "      const d = e.data;" +
+        "      if (d.cmd === 'push') { const s = d.s;" +
+        "        for (let i = 0; i < s.length; i++) {" +
+        "          if (this.used === RCAP) { this.r = (this.r + 1) % RCAP; this.used--; }" +
+        "          this.ring[this.w] = s[i]; this.w = (this.w + 1) % RCAP; this.used++;" +
+        "        }" +
+        "        this.fill = this.used / RCAP;" +
+        "        this.port.postMessage({ fill: this.fill });" +
+        "      }" +
+        "    };" +
+        "  }" +
+        "  process(inputs, outputs) {" +
+        "    const out = outputs[0][0];" +
+        "    for (let i = 0; i < out.length; i++) {" +
+        "      if (this.used > 0) {" +
+        "        out[i] = this.ring[this.r]; this.last = out[i];" +
+        "        this.r = (this.r + 1) % RCAP; this.used--;" +
+        "      } else { out[i] = this.last; }" +
+        "    }" +
+        "    this.fill = this.used / RCAP;" +
+        "    return true;" +
+        "  }" +
+        "}" +
+        "registerProcessor('deskaudio-processor', DeskAudioProcessor);").replace(/RCAP/g, String(cap));
         if (!s.pending) s.pending = [];
         if (s.ctx.audioWorklet && typeof Blob !== 'undefined' && typeof URL !== 'undefined' && URL.createObjectURL) {
             try {
@@ -828,7 +821,7 @@ module.exports.deskaudio = function (parent) {
     // [dur:2 LE][opus packet]; decoded 48 kHz mono PCM goes into the same
     // worklet ring buffer as ADPCM/PCM (the worklet is rate-agnostic - it
     // just plays what arrives at the context's rate).
-    function _ensureOpusDecoder(s) {
+    obj._ensureOpusDecoder = function (s) {
         if (s.opusDec || s.opusDecFailed) return s.opusDec;
         try {
             if (typeof AudioDecoder === 'undefined') { s.opusDecFailed = true; return null; }
@@ -841,7 +834,7 @@ module.exports.deskaudio = function (parent) {
                     try {
                         var plane = new Float32Array(frame.allocationSize({ planeIndex: 0, format: 'f32-planar' }));
                         frame.copyTo(plane, { planeIndex: 0, format: 'f32-planar' });
-                        _pushDecoded(st, plane, 48000);
+                        pluginHandler.deskaudio._pushDecoded(st, plane, 48000);
                     } catch (e) { }
                     try { frame.close(); } catch (e) { }
                 },
@@ -862,7 +855,7 @@ module.exports.deskaudio = function (parent) {
 
     // Decoded PCM from any codec goes to the worklet ring (or the fallback
     // scheduler) at its own rate.
-    function _pushDecoded(s, f32, rate) {
+    obj._pushDecoded = function (s, f32, rate) {
         var sum = 0;
         for (var i = 0; i < f32.length; i++) sum += f32[i] * f32[i];
         if (!s.gotAudio) {
@@ -895,8 +888,8 @@ module.exports.deskaudio = function (parent) {
     }
 
     // One opus chunk from the agent: [dur:2][packet] -> AudioDecoder.
-    function _opusChunk(s, bin) {
-        var dec = _ensureOpusDecoder(s);
+    obj._opusChunk = function (s, bin) {
+        var dec = pluginHandler.deskaudio._ensureOpusDecoder(s);
         if (!dec) return;                       // unsupported: no audio, but no crash
         if (bin.length < 2) return;
         var dur = bin.charCodeAt(0) | (bin.charCodeAt(1) << 8);
@@ -915,11 +908,11 @@ module.exports.deskaudio = function (parent) {
         var s = (pluginHandler.deskaudio._s || {});
         if (!s.active || !m || m.nodeid !== s.nodeid || typeof m.d !== 'string') return;
         var rate = m.rate || 16000;
-        _ensureCtx(s, rate);
+        pluginHandler.deskaudio._ensureCtx(s, rate);
         if (!s.ctx) return;
         var bin = atob(m.d);
         var f, sum = 0, i;
-        if (m.codec === 'opus') { _opusChunk(s, bin); return; }
+        if (m.codec === 'opus') { pluginHandler.deskaudio._opusChunk(s, bin); return; }
         if (m.codec === 'adpcm') {
             f = pluginHandler.deskaudio._adpcmDecode(bin);
             if (!f || f.length === 0) return;
