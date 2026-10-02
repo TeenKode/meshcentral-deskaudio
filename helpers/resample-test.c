@@ -1,9 +1,10 @@
 /* Quality test for the bundled SpeexDSP resampler (helpers/speexdsp/).
  *
- * Compiles and runs on the host (no Windows headers): CI builds it with g++
- * or cc and runs it. It feeds known tones through the resampler and checks:
+ * Compiles and runs on the host (no Windows headers): CI builds it with cc
+ * and runs it. It feeds known tones through the resampler and checks:
  *
  *   1. passband: a 1 kHz sine survives 48000 -> 16000 with < -30 dB error
+ *      relative to a reference sine at the output rate
  *   2. anti-alias: a 12 kHz sine (which would alias to 4 kHz) is suppressed
  *      by at least 40 dB, as required by the plan (п. 8)
  *   3. arbitrary ratio: the same holds for 44100 -> 16000
@@ -32,6 +33,32 @@ static double rms_db(const short* buf, size_t n) {
     double s = 0.0;
     for (size_t i = 0; i < n; i++) s += (double)buf[i] * buf[i];
     return 20.0 * log10(sqrt(s / (double)n) / 32768.0 + 1e-30);
+}
+
+/* 20*log10 RMS error between `out` and a reference sine (`freq`, output rate
+ * `dst`), after finding the best time offset by brute-force correlation over
+ * +/- `maxlag` samples. This absorbs the resampler's group delay without
+ * hard-coding it. Returns the error in dB. */
+static double tone_err_db(const short* out, size_t n, double freq, spx_uint32_t dst) {
+    size_t win = (n / 4 < 1000) ? (n / 4) : 1000;   /* correlation window */
+    long maxlag = 64;
+    if (n <= (size_t)(2 * maxlag) + win + 8) return -1e30;
+
+    double best_e = 1e30;
+    for (long lag = -maxlag; lag <= maxlag; lag++) {
+        double s = 0.0;
+        size_t cnt = 0;
+        size_t i0 = (size_t)(n / 2) + lag;
+        for (size_t i = 0; i < win; i++, cnt++) {
+            double t = ((double)((long)i + lag) + 0.0) / (double)dst;
+            double ref = 32767.0 * sin(2.0 * M_PI * freq * t);
+            double got = out[i0 + i];
+            s += (got - ref) * (got - ref);
+        }
+        double e = sqrt(s / (double)cnt);
+        if (e < best_e) best_e = e;
+    }
+    return 20.0 * log10(best_e / 32768.0 + 1e-30);
 }
 
 /* Feed `n` samples of a sine through the resampler, return output length. */
@@ -76,13 +103,10 @@ int main(void) {
         char label[32];
         snprintf(label, sizeof(label), "%u->%u", src, dst);
 
-        /* 1: passband 1 kHz */
+        /* 1: passband 1 kHz — error vs a reference sine, phase-agnostic */
         size_t n1 = run_tone(src, dst, 1000.0, src, out, cap, 0);
-        /* reference: expected amplitude ~32767 (0 dBFS); error = how much the
-           signal deviates from a clean sine is checked via alias-style RMS:
-           a 1 kHz tone must come out near full amplitude. */
-        double a1 = rms_db(out + n1 / 4, n1 / 2);
-        if (a1 < -1.0) { printf("FAIL %s passband 1kHz: %.1f dB (want >= -1.0)\n", label, a1); fails++; }
+        double a1 = tone_err_db(out, n1, 1000.0, dst);
+        if (a1 > -30.0) { printf("FAIL %s passband 1kHz: %.1f dB (want <= -30)\n", label, a1); fails++; }
         else printf("ok   %s passband 1kHz: %.1f dB\n", label, a1);
 
         /* 2: anti-alias 12 kHz -> would alias to 4 kHz */
