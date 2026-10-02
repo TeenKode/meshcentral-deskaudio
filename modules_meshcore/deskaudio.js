@@ -116,17 +116,65 @@ function startWatch() {
 }
 function stopWatch() { if (watchdog != null) { clearInterval(watchdog); watchdog = null; } }
 
-function run(path, args) {
+// Native helper protocol: stdout carries [len:2 LE][flags:1][payload] frames.
+// flags bit0 = silence (empty payload — skip it), bit1 = ADPCM payload. The
+// agent only re-frames and base64-encodes: no DSP in Duktape anymore.
+// Stream chunks can split frames at arbitrary byte offsets, so a partial
+// frame is carried over between 'data' events.
+var FRAME_HDR = 3;
+var frameRem = null;   // { hdr: bytes(3), need, got, flags, buf }
+
+function feedFramed(x, sid) {
+    var i = 0;
+    while (i < x.length) {
+        if (frameRem === null) {
+            // need 3 header bytes to start a frame
+            if (i + FRAME_HDR > x.length) { frameRem = { hdr: x.slice(i), need: 0, got: 0, flags: 0, buf: null, partialHdr: true }; return; }
+            var len = x[i] | (x[i + 1] << 8);
+            var flags = x[i + 2];
+            i += FRAME_HDR;
+            if ((flags & 0x01) !== 0 || len === 0) continue;   // silent/empty frame: nothing to relay
+            frameRem = { need: len, got: 0, flags: flags, buf: Buffer.alloc ? Buffer.alloc(len) : new Buffer(len) };
+            continue;
+        }
+        if (frameRem.partialHdr) {
+            // finish a split header
+            while (frameRem.hdr.length < FRAME_HDR && i < x.length) frameRem.hdr = Buffer.concat([frameRem.hdr, x.slice(i, i + 1)]), i++;
+            if (frameRem.hdr.length < FRAME_HDR) return;
+            var len2 = frameRem.hdr[0] | (frameRem.hdr[1] << 8);
+            var flags2 = frameRem.hdr[2];
+            frameRem = null;
+            if ((flags2 & 0x01) !== 0 || len2 === 0) continue;
+            frameRem = { need: len2, got: 0, flags: flags2, buf: Buffer.alloc ? Buffer.alloc(len2) : new Buffer(len2) };
+            continue;
+        }
+        var take = Math.min(frameRem.need - frameRem.got, x.length - i);
+        x.copy(frameRem.buf, frameRem.got, i, i + take);
+        frameRem.got += take; i += take;
+        if (frameRem.got === frameRem.need) {
+            var f = frameRem; frameRem = null;
+            var msg = { pluginaction: 'chunk', sid: sid, rate: curRate, d: f.buf.toString('base64') };
+            if ((f.flags & 0x02) !== 0) msg.codec = 'adpcm';   // the browser picks its decoder by this
+            send(msg);
+        }
+    }
+}
+
+function run(path, args, framed) {
     var sid = curSid;
     var c;
     try { c = spawn(path, args); } catch (e) { return fail('Не удалось запустить хелпер: ' + e); }
     child = c;
+    frameRem = null;
     c.stderr.on('data', function (x) {
         errBuf += x.toString();
         if (errBuf.length > 2000) errBuf = errBuf.slice(-2000);
     });
     c.stdout.on('data', function (x) {
         if (child !== c) return;
+        if (framed) { feedFramed(x, sid); return; }
+        // Linux (parec raw PCM): the agent still encodes here — there is no
+        // native helper on that platform yet.
         if (curSilence && isSilent(x)) return;   // don't stream pure silence
         if (curCompress) send({ pluginaction: 'chunk', sid: sid, rate: curRate, codec: 'adpcm', d: adpcmEncode(x).toString('base64') });
         else send({ pluginaction: 'chunk', sid: sid, rate: curRate, d: x.toString('base64') });
@@ -134,6 +182,7 @@ function run(path, args) {
     c.on('exit', function (code) {
         if (child !== c) return;
         child = null;
+        frameRem = null;
         stopWatch();
         send({ pluginaction: 'status', sid: sid, state: (code == 0 ? 'stopped' : 'error'), code: (code == 0 ? 'helper_exit' : 'helper_failed'), exitcode: code, msg: errBuf });
     });
@@ -205,9 +254,11 @@ function startWin(a) {
     // A second name is used if the first is locked (e.g. a previous capture is
     // still exiting while a new helper version is dropped).
     var names = ['deskaudio-helper.exe', 'deskaudio-helper-b.exe'];
+    var hargs = ['deskaudio.exe', String(curRate), curCompress ? 'adpcm' : 'pcm'];
+    if (curSilence) hargs.push('silence');
     for (var i = 0; i < names.length; i++) {
         var p = dropFile(fs, dir, names[i], data);
-        if (p) return run(p, ['deskaudio.exe', String(curRate)]);
+        if (p) return run(p, hargs, true);
     }
     fail('Не удалось записать хелпер в папку агента: ' + dir, 'helper_write');
 }

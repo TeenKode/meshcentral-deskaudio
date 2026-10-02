@@ -1,5 +1,13 @@
 // Native WASAPI loopback capture of the default render device — no .NET required.
-// Writes raw s16le mono PCM at the requested rate to stdout.
+//
+// Output on stdout is a stream of frames:  [len:2 LE][flags:1][payload].
+//   flags bit0 (0x01) = silence: the payload is empty; the receiver keeps
+//                       the stream continuous but sends nothing over the air
+//   flags bit1 (0x02) = payload is ADPCM (each frame a self-contained block);
+//                       without the bit the payload is raw s16le PCM.
+// A frame is emitted at most every FLUSH_MS of audio. Frame boundaries are
+// independent of WASAPI packet boundaries: partial frames are kept back.
+// Arguments:  deskaudio.exe <rate> [adpcm|pcm] [silence]
 //
 // Depends only on system DLLs present on every Windows since Vista/7 (ole32).
 // Cross-compiled from Linux with MinGW-w64, statically linked so the produced
@@ -26,6 +34,15 @@
 
 static const int FLUSH_MS = 40;
 
+#include "adpcm-enc.h"
+
+// True when every sample is exactly zero (WASAPI marks real silence, but the
+// resampler output is what we check — matches the agent's old isSilent()).
+static int allZero(const short* in, int nSamp) {
+    for (int i = 0; i < nSamp; i++) if (in[i] != 0) return 0;
+    return 1;
+}
+
 static int fail(const char* msg, HRESULT hr) {
     if (hr) fprintf(stderr, "%s (0x%08lX)\n", msg, (unsigned long)hr);
     else fprintf(stderr, "%s\n", msg);
@@ -42,6 +59,13 @@ static const int REOPEN_MAX_ATTEMPTS = 10;
 int main(int argc, char** argv) {
     int dstRate = (argc > 1) ? atoi(argv[1]) : 16000;
     if (dstRate != 8000 && dstRate != 16000 && dstRate != 24000) dstRate = 16000;
+    // codec: "adpcm" (default) or "pcm"; "silence" to suppress silent frames.
+    bool useAdpcm = true, suppressSilence = false;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "pcm") == 0) useAdpcm = false;
+        else if (strcmp(argv[i], "adpcm") == 0) useAdpcm = true;
+        else if (strcmp(argv[i], "silence") == 0) suppressSilence = true;
+    }
 
     // stdout must be binary, otherwise 0x0A bytes get mangled to 0x0D 0x0A.
     _setmode(_fileno(stdout), _O_BINARY);
@@ -111,7 +135,20 @@ int main(int argc, char** argv) {
         int monoCap = 65536, outCap = 65536;
         short* mono = (short*)malloc(monoCap * sizeof(short));
         short* rOut = (short*)malloc(outCap * sizeof(short));
-        if (!mono || !rOut) { free(mono); free(rOut); deskaudio_resampler_destroy(res); pCapture->Release(); CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release(); pEnum->Release(); CoUninitialize(); return fail("out of memory", 0); }
+        // Frame assembly: resampler output accumulates here until FLUSH_MS of
+        // audio is ready (or more), then is emitted as [len:2][flags:1][payload].
+        int frameSamples = dstRate * FLUSH_MS / 1000;
+        int pendCap = frameSamples + outCap;
+        short* pend = (short*)malloc(pendCap * sizeof(short));
+        int pendLen = 0;
+        // ADPCM payload worst case: 4 + n/2 + 1 per frame.
+        int encCap = 4 + (frameSamples + outCap) / 2 + 16;
+        unsigned char* enc = (unsigned char*)malloc(encCap);
+        if (!mono || !rOut || !pend || !enc) {
+            free(mono); free(rOut); free(pend); free(enc);
+            deskaudio_resampler_destroy(res); pCapture->Release(); CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release(); pEnum->Release(); CoUninitialize();
+            return fail("out of memory", 0);
+        }
 
         bool fatal = false;
         for (;;) {
@@ -144,7 +181,42 @@ int main(int argc, char** argv) {
                 pCapture->ReleaseBuffer(frames);
                 spx_uint32_t inLen = frames, outLen = outCap;
                 deskaudio_resampler_process_int(res, 0, mono, &inLen, rOut, &outLen);
-                if (outLen > 0) { fwrite(rOut, sizeof(short), outLen, stdout); fflush(stdout); }
+                // Accumulate into the pending frame buffer; emit every
+                // frameSamples (40 ms) as one frame, independent of how WASAPI
+                // split the audio into packets.
+                if (outLen > 0 && pendLen + (int)outLen <= pendCap) {
+                    memcpy(pend + pendLen, rOut, outLen * sizeof(short));
+                    pendLen += (int)outLen;
+                }
+                while (pendLen >= frameSamples) {
+                    int silent = allZero(pend, frameSamples);
+                    if (suppressSilence && silent) {
+                        // keep the frame count honest but send no payload:
+                        // a 3-byte frame with the silence flag
+                        unsigned char hdr[3];
+                        hdr[0] = 0; hdr[1] = 0; hdr[2] = 0x01;
+                        fwrite(hdr, 1, 3, stdout);
+                    } else if (useAdpcm) {
+                        int n = da_adpcmEncode(pend, frameSamples, enc);
+                        unsigned char hdr[3];
+                        hdr[0] = (unsigned char)(n & 0xFF);
+                        hdr[1] = (unsigned char)((n >> 8) & 0xFF);
+                        hdr[2] = 0x02;      // ADPCM payload
+                        fwrite(hdr, 1, 3, stdout);
+                        if (n > 0) fwrite(enc, 1, n, stdout);
+                    } else {
+                        int n = frameSamples * 2;
+                        unsigned char hdr[3];
+                        hdr[0] = (unsigned char)(n & 0xFF);
+                        hdr[1] = (unsigned char)((n >> 8) & 0xFF);
+                        hdr[2] = 0x00;      // raw s16le
+                        fwrite(hdr, 1, 3, stdout);
+                        fwrite(pend, 1, n, stdout);
+                    }
+                    fflush(stdout);
+                    memmove(pend, pend + frameSamples, (pendLen - frameSamples) * sizeof(short));
+                    pendLen -= frameSamples;
+                }
                 if (ferror(stdout)) { fatal = true; break; }
                 hr = pCapture->GetNextPacketSize(&pkt);
                 if (FAILED(hr)) break;
@@ -153,7 +225,7 @@ int main(int argc, char** argv) {
             if (FAILED(hr)) break;   // reopen path below
         }
 
-        free(mono); free(rOut);
+        free(mono); free(rOut); free(pend); free(enc);
         deskaudio_resampler_destroy(res);
         pClient->Stop();
         pCapture->Release();

@@ -52,6 +52,24 @@ jobs:
       - uses: actions/checkout@v4
       - run: shellcheck helpers/*.sh
 
+  # Byte-exactness of the native ADPCM encoder vs the JS encoder: the C test
+  # (helpers/adpcm-test.c, which includes the same adpcm-enc.h the Windows
+  # helper compiles) prints one hex line per 40 ms block; it must equal the
+  # committed fixture, which the Node suite separately verifies against the
+  # JS encoder. Both sides therefore provably produce identical bytes.
+  adpcm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native encoder matches the fixture
+        run: |
+          cc -O2 -Wall -o /tmp/adpcm-test helpers/adpcm-test.c -lm
+          /tmp/adpcm-test > /tmp/adpcm-actual.hex
+          if ! diff -u test/fixtures/native-adpcm.hex /tmp/adpcm-actual.hex; then
+            echo "::error::helpers/adpcm-enc.h output differs from the JS encoder fixture — the C port is no longer byte-exact"
+            exit 1
+          fi
+
   # The resampler quality gate: build the host test with g++ and run it. Checks
   # passband fidelity and anti-alias suppression for 48k and 44.1k -> 16k,
   # and that streaming in odd-sized pieces matches one-shot resampling.
