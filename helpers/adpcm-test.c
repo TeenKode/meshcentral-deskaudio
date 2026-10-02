@@ -38,6 +38,10 @@ int main(int argc, char** argv) {
         in[i] = (short)v;
     }
 
+    if (getenv("DA_DUMP_SIGNAL")) {
+        for (int i = 0; i < 8; i++) printf("%d ", in[i]);
+        printf("\n");
+    }
     int block = 640;                     /* one 40 ms frame at 16 kHz */
     for (int off = 0; off + block <= N; off += block) {
         unsigned char out[4 + block / 2 + 1];
