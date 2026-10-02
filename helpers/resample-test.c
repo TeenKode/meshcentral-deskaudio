@@ -47,8 +47,9 @@ static double tone_err_db(const short* out, size_t n, double freq, spx_uint32_t 
        KNOWN output frequency 1000 Hz at 16000 Hz -> exactly 16 samples per
        period, an integer, so any window aligned to 16 gives a clean DFT bin. */
     double ss = 0.0, sc = 0.0, energy = 0.0;
-    size_t win = (n / 16) * 16;          /* whole periods only */
     size_t skip = n / 8;                 /* skip the filter's settling tail */
+    size_t avail = n - skip;
+    size_t win = (avail / 16) * 16;      /* whole periods only */
     for (size_t i = skip; i < skip + win; i++) {
         double ph = 2.0 * M_PI * 1000.0 * (double)i / 16000.0;
         ss += out[i] * sin(ph);
