@@ -26,7 +26,8 @@ var errBuf = '';
 var lastKeep = 0;
 var watchdog = null;
 
-var PROTO = 2;            // 2 = understands sid and consent
+var PROTO = 3;            // 2 = understands sid and consent; 3 = fetches the helper on demand
+var pendingWin = null;    // start args waiting for the helper bytes ('need' sent)
 
 function send(o) {
     o.action = 'plugin';
@@ -262,22 +263,12 @@ function dropFile(fs, dir, name, data) {
 // The helper runs only from the agent's own folder (writable by administrators
 // only, and normally already excluded by antivirus). There is deliberately no
 // fallback to %TEMP%: C:\Windows\Temp is writable by ordinary users.
-function startWin(a) {
-    var fs = require('fs');
-    var dir = agentDir();
-    if (!dir) return fail('Не удалось определить папку агента', 'helper_failed');
+function sha384(buf) {
+    try { return require('SHA384Stream').create().syncHash(buf).toString('hex'); }      // MeshAgent
+    catch (e) { return require('crypto').createHash('sha384').update(buf).digest('hex'); } // Node (tests)
+}
 
-    // 64-bit build on x64 Windows; the 32-bit build everywhere else. On ARM64
-    // the x86 build runs under emulation on both Windows 10 and 11 (x64
-    // emulation exists only on Windows 11).
-    var arch = process.env['PROCESSOR_ARCHITEW6432'] || process.env['PROCESSOR_ARCHITECTURE'];
-    var exeB64 = (arch == 'AMD64') ? a.exe64 : a.exe32;
-    if (!exeB64) exeB64 = a.exe32 || a.exe64;   // no arch env (or one build only): either will do
-    if (!exeB64) return fail('Нет хелпера для Windows', 'no_helpers');
-    var data = Buffer.from(exeB64, 'base64');
-    // A second name is used if the first is locked (e.g. a previous capture is
-    // still exiting while a new helper version is dropped).
-    var names = ['deskaudio-helper.exe', 'deskaudio-helper-b.exe'];
+function helperArgs() {
     var hargs = ['deskaudio.exe', String(curRate)];
     if (curCodec === 'opus') {
         hargs.push('opus');
@@ -286,14 +277,73 @@ function startWin(a) {
         hargs.push(curCompress ? 'adpcm' : 'pcm');
     }
     if (curSilence) hargs.push('silence');
-    for (var i = 0; i < names.length; i++) {
-        var p = dropFile(fs, dir, names[i], data);
+    return hargs;
+}
+
+// 64-bit build on x64 Windows; the 32-bit build everywhere else. On ARM64 the
+// x86 build runs under emulation on both Windows 10 and 11 (x64 emulation
+// exists only on Windows 11).
+function winArch() {
+    var arch = process.env['PROCESSOR_ARCHITEW6432'] || process.env['PROCESSOR_ARCHITECTURE'];
+    return (arch == 'AMD64') ? 'x64' : 'x86';
+}
+
+// A second name is used if the first is locked (e.g. a previous capture is
+// still exiting while a new helper version is dropped).
+var HELPER_NAMES = ['deskaudio-helper.exe', 'deskaudio-helper-b.exe'];
+
+// Start the helper from bytes we hold (sent with 'start' by older servers,
+// or fetched with 'need').
+function startWinWith(dir, data, how) {
+    var fs = require('fs');
+    var hargs = helperArgs();
+    for (var i = 0; i < HELPER_NAMES.length; i++) {
+        var p = dropFile(fs, dir, HELPER_NAMES[i], data);
         if (p) {
-            log('helper ' + p + ' (' + (arch || '?') + ', ' + data.length + ' bytes) ' + hargs.slice(1).join(' '));
+            log('helper ' + p + ' (' + winArch() + ', ' + data.length + ' bytes, ' + how + ') ' + hargs.slice(1).join(' '));
             return run(p, hargs, true);
         }
     }
     fail('Не удалось записать хелпер в папку агента: ' + dir, 'helper_write');
+}
+
+function startWin(a) {
+    var fs = require('fs');
+    var dir = agentDir();
+    if (!dir) return fail('Не удалось определить папку агента', 'helper_failed');
+    var want = winArch();
+
+    // Old server: the bytes came with the start message.
+    var exeB64 = (want == 'x64') ? a.exe64 : a.exe32;
+    if (!exeB64) exeB64 = a.exe32 || a.exe64;
+    if (exeB64) return startWinWith(dir, Buffer.from(exeB64, 'base64'), 'received');
+
+    // New server: only the identity of the helper. Reuse our copy if it matches.
+    var meta = a.helper && a.helper[want];
+    if (!meta || !meta.sha) return fail('Нет хелпера для Windows', 'no_helpers');
+    for (var i = 0; i < HELPER_NAMES.length; i++) {
+        var p = dir + '\\' + HELPER_NAMES[i], cur = null;
+        try { cur = fs.readFileSync(p); } catch (e) { }
+        if (cur && cur.length === meta.size && sha384(cur) === meta.sha) {
+            var hargs = helperArgs();
+            log('helper ' + p + ' (' + want + ', up to date) ' + hargs.slice(1).join(' '));
+            return run(p, hargs, true);
+        }
+    }
+    // Missing or stale: ask the server for this build once.
+    pendingWin = { sid: curSid, dir: dir, sha: meta.sha };
+    log('helper missing or outdated: downloading the ' + want + ' build (' + meta.size + ' bytes)');
+    send({ pluginaction: 'need', sid: curSid, proto: PROTO, arch: want });
+}
+
+// The server's answer to 'need'.
+function onHelper(args) {
+    var pw = pendingWin;
+    if (!pw || args.sid !== pw.sid || curSid !== pw.sid || typeof args.data !== 'string') return;
+    pendingWin = null;
+    var data = Buffer.from(args.data, 'base64');
+    if (sha384(data) !== pw.sha) return fail('Хелпер повреждён при передаче', 'helper_failed');
+    startWinWith(pw.dir, data, 'downloaded');
 }
 
 // Ask the local user for consent. Resolves `cb(true)` on "yes", `cb(false)` on
@@ -346,6 +396,7 @@ function startCapture(a) {
 
 function stopCapture(silent) {
     stopWatch();
+    pendingWin = null;
     if (pending) { try { if (pending.close) pending.close(); } catch (e) { } pending = null; }
     var c = child, sid = curSid;
     child = null;
@@ -379,6 +430,7 @@ function consoleaction(args, rights, sessionid, parent) {
             });
             break;
         case 'notify': if (forCurrent(args) && args.consent) notifyUser(args.consent); break;
+        case 'helper': onHelper(args); break;
     }
 }
 

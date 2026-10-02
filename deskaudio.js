@@ -39,6 +39,12 @@ module.exports.deskaudio = function (parent) {
     var nextSid = 1;
     var nextReq = 1;
     var sessState = new WeakMap();   // user session -> { hooked, gen: {nodeid: n} }
+    // agent connection -> protocol version it reported. From 3 on, the agent
+    // keeps the helper and asks for it only when its copy is missing or stale
+    // ('need'), so a start no longer carries ~1 MB of helper bytes. A reconnect
+    // is a new connection object, so an updated (or downgraded) core is
+    // re-learned on its first start.
+    var agentProto = new WeakMap();
     var keepTimer = null;
     var helperCache = null;
 
@@ -47,18 +53,27 @@ module.exports.deskaudio = function (parent) {
 
     function md5(buf) { return crypto.createHash('md5').update(buf).digest('hex').substring(0, 8); }
 
+    // Set one Windows helper build in the cache: bytes (base64) plus the
+    // identity an agent checks its local copy against (SHA-384 and size).
+    // `key` is 'exe64' or 'exe32'.
+    function setExe(h, key, buf) {
+        var arch = (key === 'exe64') ? '64' : '32';
+        h[key] = buf.toString('base64');
+        h['ver' + arch] = md5(buf);
+        h['sha' + arch] = crypto.createHash('sha384').update(buf).digest('hex');
+        h['size' + arch] = buf.length;
+    }
+
     function loadHelpers() {
         if (helperCache) return helperCache;
         var sh = fs.readFileSync(path.join(__dirname, 'helpers', 'linux-capture.sh'));
         var exe64 = fs.readFileSync(path.join(__dirname, 'helpers', 'deskaudio-x64.exe'));
         var exe32 = fs.readFileSync(path.join(__dirname, 'helpers', 'deskaudio-x86.exe'));
-        helperCache = {
-            script: sh.toString('base64'),
-            // Windows: prebuilt native helpers (no .NET required). 32-bit build runs
-            // on 32- and 64-bit Windows; 64-bit build runs natively on x64.
-            exe64: exe64.toString('base64'), ver64: md5(exe64),
-            exe32: exe32.toString('base64'), ver32: md5(exe32)
-        };
+        // Windows: prebuilt native helpers (no .NET required). 32-bit build runs
+        // on 32- and 64-bit Windows; 64-bit build runs natively on x64.
+        helperCache = { script: sh.toString('base64') };
+        setExe(helperCache, 'exe64', exe64);
+        setExe(helperCache, 'exe32', exe32);
         return helperCache;
     }
 
@@ -111,8 +126,7 @@ module.exports.deskaudio = function (parent) {
                 var outPath = path.join(outDir, 'deskaudio-signed-' + h[f[2]] + '-' + certKey + '-' + f[0]);
                 if (fs.existsSync(outPath)) {
                     var cached = fs.readFileSync(outPath);
-                    h[f[1]] = cached.toString('base64');
-                    h[f[2]] = md5(cached);
+                    setExe(h, f[1], cached);
                     return;
                 }
                 var hnd = authenticode.createAuthenticodeHandler(inPath);
@@ -121,8 +135,7 @@ module.exports.deskaudio = function (parent) {
                     try {
                         if (!err) {
                             var signed = fs.readFileSync(outPath);
-                            h[f[1]] = signed.toString('base64');
-                            h[f[2]] = md5(signed);
+                            setExe(h, f[1], signed);
                             log('signed ' + f[0] + ' with server code-signing certificate');
                         } else { log('signing failed for ' + f[0] + ': ' + err); }
                     } catch (e) { }
@@ -324,19 +337,26 @@ module.exports.deskaudio = function (parent) {
                 !(codecs && codecs.indexOf('pcm') >= 0 && codecs.indexOf('adpcm') < 0 && codecs.indexOf('opus') < 0);
             var bitrate = parseInt(command.bitrate, 10);
             if ([24, 32, 48].indexOf(bitrate) < 0) bitrate = 32;
-            sendAgent(agent, {
+            var startMsg = {
                 pluginaction: 'start', sid: st.sid, rate: rate,
                 compress: compress, silence: command.silence !== false,
                 codec: st.codec, bitrate: bitrate,
                 consent: consent, script: h.script,
-                exe64: h.exe64, ver64: h.ver64, exe32: h.exe32, ver32: h.ver32
-            });
+                helper: { x64: { sha: h.sha64, size: h.size64 }, x86: { sha: h.sha32, size: h.size32 } }
+            };
+            // An agent not yet known to fetch helpers on demand gets the bytes.
+            if (!(agentProto.get(agent) >= 3)) {
+                startMsg.exe64 = h.exe64; startMsg.ver64 = h.ver64;
+                startMsg.exe32 = h.exe32; startMsg.ver32 = h.ver32;
+            }
+            sendAgent(agent, startMsg);
         });
     }
 
     // ---------- agent -> server ----------
     function agentAction(command, agent) {
         var nodeid = agent.dbNodeKey;   // taken from the authenticated agent, never from the message
+        if (typeof command.proto === 'number') agentProto.set(agent, command.proto);
         var st = streams[nodeid];
         var sid = (typeof command.sid === 'number') ? command.sid : null;
         if (st && sid !== null && sid !== st.sid) return;   // stale message from an earlier capture
@@ -376,6 +396,14 @@ module.exports.deskaudio = function (parent) {
                     if (command.codec) st.codec = (command.codec === 'opus') ? 'opus' : null;   // what the agent really runs
                 }
                 st.listeners.forEach(function (s) { sendStatus(s, nodeid, state, code, msg, { rate: command.rate, timeout: command.timeout }); });
+                break;
+            case 'need':
+                // The agent has no (or a stale) copy of the helper: send it once.
+                var hh;
+                try { hh = loadHelpers(); } catch (e) { return; }
+                var arch = (command.arch === 'x64') ? 'x64' : 'x86';
+                sendAgent(agent, { pluginaction: 'helper', sid: st.sid, arch: arch,
+                                   data: (arch === 'x64') ? hh.exe64 : hh.exe32, sha: (arch === 'x64') ? hh.sha64 : hh.sha32 });
                 break;
             case 'log':
                 var line = String(command.msg || '').substring(0, 300);

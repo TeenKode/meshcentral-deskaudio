@@ -204,6 +204,50 @@ describe("agent (Windows)", { skip: !isWin ? "windows-only: runs on the windows 
         });
     });
 
+    const sha = (b) => require("crypto").createHash("sha384").update(b).digest("hex");
+
+    test("on-demand helper: a missing copy is requested once, verified, dropped and run", () => {
+        withWinAgent(({ ag, calls, sent, files, parent }) => {
+            const exe = Buffer.from("MZ new helper build");
+            ag.consoleaction({ pluginaction: "start", sid: 4, rate: 16000,
+                helper: { x64: { sha: sha(exe), size: exe.length }, x86: { sha: "00", size: 1 } } }, 0, 0, parent);
+            assert.strictEqual(calls.length, 0, "nothing to run yet");
+            const need = sent.find((m) => m.pluginaction === "need");
+            assert.ok(need && need.arch === "x64" && need.sid === 4 && need.proto === 3);
+
+            ag.consoleaction({ pluginaction: "helper", sid: 3, arch: "x64", data: exe.toString("base64") }, 0, 0, parent);
+            assert.strictEqual(calls.length, 0, "answer for another session ignored");
+            ag.consoleaction({ pluginaction: "helper", sid: 4, arch: "x64", data: exe.toString("base64") }, 0, 0, parent);
+            assert.strictEqual(calls.length, 1, "helper launched after download");
+            assert.ok(Object.values(files).some((f) => f.equals(exe)), "helper written to the agent folder");
+        });
+    });
+
+    test("on-demand helper: a matching local copy starts without any download", () => {
+        withWinAgent(({ ag, calls, sent, files, parent }) => {
+            const exe = Buffer.from("MZ current helper");
+            const dir = require("path").dirname(process.execPath);
+            const p = (process.execPath.lastIndexOf("\\") >= 0 ? process.execPath.substring(0, process.execPath.lastIndexOf("\\")) : dir) + "\\deskaudio-helper.exe";
+            files[p] = exe;
+            ag.consoleaction({ pluginaction: "start", sid: 5, rate: 16000,
+                helper: { x64: { sha: sha(exe), size: exe.length }, x86: { sha: sha(exe), size: exe.length } } }, 0, 0, parent);
+            assert.ok(!sent.some((m) => m.pluginaction === "need"), "no download");
+            assert.strictEqual(calls.length, 1);
+            assert.strictEqual(calls[0].file, p);
+        });
+    });
+
+    test("on-demand helper: a corrupted download is refused", () => {
+        withWinAgent(({ ag, calls, sent, parent }) => {
+            const exe = Buffer.from("MZ good");
+            ag.consoleaction({ pluginaction: "start", sid: 6, rate: 16000,
+                helper: { x64: { sha: sha(exe), size: exe.length }, x86: { sha: sha(exe), size: exe.length } } }, 0, 0, parent);
+            ag.consoleaction({ pluginaction: "helper", sid: 6, arch: "x64", data: Buffer.from("MZ evil").toString("base64") }, 0, 0, parent);
+            assert.strictEqual(calls.length, 0);
+            assert.strictEqual(sent.filter((m) => m.pluginaction === "status").pop().state, "error");
+        });
+    });
+
     // ---- dropFile itself is platform-independent; keep it here so the
     // Windows runner exercises the exact helper-drop code path. ----
     test("dropFile writes the helper, reuses an identical file, replaces a planted one", () => {

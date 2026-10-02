@@ -62,7 +62,7 @@ describe("agent (Linux)", { skip: !isLinux ? "linux-only: runs on the ubuntu CI 
             const st = sent.find((m) => m.pluginaction === "status");
             assert.strictEqual(st.state, "started");
             assert.strictEqual(st.sid, 7);
-            assert.strictEqual(st.proto, 2);
+            assert.strictEqual(st.proto, 3);
         });
     });
 

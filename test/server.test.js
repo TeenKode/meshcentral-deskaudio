@@ -577,3 +577,47 @@ test("agent log lines are relayed to the listeners' log windows", () => {
     assert.strictEqual(logs.length, 1, "stale-session lines are dropped");
     assert.ok(logs[0].msg.startsWith("capture: 48000 Hz") && logs[0].msg.length === 300, "truncated to 300 chars");
 });
+
+// ---------- helper delivery on demand ----------
+
+test("helper bytes are sent until the agent shows it fetches them on demand", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = makeWeb();
+    const sess = makeUserSession();
+
+    userStart(obj, sess, web);
+    let st = agentStarts(agent)[0];
+    assert.ok(st.exe64 && st.exe32, "unknown agent core: full bytes");
+    assert.match(st.helper.x64.sha, /^[0-9a-f]{96}$/, "SHA-384 of the x64 build");
+    assert.ok(st.helper.x86.size > 100000);
+
+    agentMsg(obj, agent, { pluginaction: "status", sid: st.sid, state: "started", proto: 3, rate: 16000 });
+    userStop(obj, sess, web);
+    userStart(obj, sess, web);
+    st = agentStarts(agent)[1];
+    assert.strictEqual(st.exe64, undefined, "proto 3 agent: no helper bytes in start");
+    assert.strictEqual(st.exe32, undefined);
+    assert.ok(JSON.stringify(st).length < 5000, "start message is small: " + JSON.stringify(st).length + " bytes");
+
+    agentMsg(obj, agent, { pluginaction: "need", sid: st.sid, proto: 3, arch: "x86" });
+    const h = agent.sent.filter((m) => m.pluginaction === "helper").pop();
+    assert.strictEqual(h.arch, "x86");
+    assert.strictEqual(h.sid, st.sid);
+    const bytes = Buffer.from(h.data, "base64");
+    assert.strictEqual(require("crypto").createHash("sha384").update(bytes).digest("hex"), st.helper.x86.sha);
+});
+
+test("a reconnected agent (new connection) is sent the bytes again", () => {
+    const { obj, meshServer } = loadPlugin();
+    let agent = connectAgent(meshServer, NODE);
+    const web = makeWeb();
+    const sess = makeUserSession();
+    userStart(obj, sess, web);
+    const sid = agentStarts(agent)[0].sid;
+    agentMsg(obj, agent, { pluginaction: "status", sid, state: "started", proto: 3, rate: 16000 });
+    userStop(obj, sess, web);
+    agent = connectAgent(meshServer, NODE);          // new core, new connection object
+    userStart(obj, sess, web);
+    assert.ok(agentStarts(agent)[0].exe64, "unknown again: full bytes");
+});
