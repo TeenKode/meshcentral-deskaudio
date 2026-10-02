@@ -58,6 +58,10 @@ build_one() {
         -DCMAKE_C_FLAGS="-Os -fno-exceptions -fno-asynchronous-unwind-tables" \
         > /dev/null
     cmake --build "$OUT" --target opus -j"$(nproc)" > /dev/null
+    # The build tree has no staged headers; stage them ourselves where
+    # build-native.sh expects them: <arch-dir>/include/opus/opus.h.
+    mkdir -p "$OUT/include/opus"
+    cp "$SRC"/include/*.h "$OUT/include/opus/"
     echo "built: $OUT"
     ls -la "$OUT/libopus.a"
 }
