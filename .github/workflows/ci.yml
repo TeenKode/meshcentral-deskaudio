@@ -28,14 +28,9 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq g++-mingw-w64-x86-64 g++-mingw-w64-i686
       - name: Build helpers
         run: sh helpers/build-native.sh
-      - name: Committed helpers match the source
-        run: |
-          if ! git diff --quiet -- helpers/deskaudio-x64.exe helpers/deskaudio-x86.exe; then
-            echo "::error::helpers/*.exe differ from win-loopback-native.cpp — run helpers/build-native.sh on Ubuntu 24.04 and commit the result"
-            exit 1
-          fi
-      # Uploaded so the binaries can be fetched and committed when the source
-      # legitimately changes (this runner has the exact pinned toolchain).
+      # Uploaded before the match check, so the binaries can be fetched and
+      # committed when the source legitimately changes (this runner has the
+      # exact pinned toolchain).
       - name: Upload rebuilt helpers
         uses: actions/upload-artifact@v4
         with:
@@ -44,6 +39,12 @@ jobs:
             helpers/deskaudio-x64.exe
             helpers/deskaudio-x86.exe
           if-no-files-found: error
+      - name: Committed helpers match the source
+        run: |
+          if ! git diff --quiet -- helpers/deskaudio-x64.exe helpers/deskaudio-x86.exe; then
+            echo "::error::helpers/*.exe differ from win-loopback-native.cpp — run helpers/build-native.sh on Ubuntu 24.04 and commit the result"
+            exit 1
+          fi
 
   shellcheck:
     runs-on: ubuntu-latest
