@@ -13,13 +13,11 @@
 #
 # The build is reproducible (--no-insert-timestamp): CI rebuilds the helpers on
 # Ubuntu 24.04 and fails if the committed .exe files differ from the source.
-set -e
-cd "$(dirname "$0")"
 
-# Passed to both compilers as separate arguments. Kept as positional parameters
-# and expanded with "$@" (not an unquoted $FLAGS) so the flags survive word
-# splitting without tripping shellcheck SC2086.
-set -- -O2 -static -static-libgcc -static-libstdc++ -s -Wall -Wl,--no-insert-timestamp
+# Compiler flags. Kept in a variable (not the script's positional parameters:
+# build_one() has its own "$@") and expanded with a deliberate unquoted word
+# split - the string is fixed and contains no globs.
+CXXFLAGS="-O2 -static -static-libgcc -static-libstdc++ -s -Wall -Wl,--no-insert-timestamp"
 
 # resample.c (SpeexDSP) is included directly by win-loopback-native.cpp, so the
 # only compile unit is the .cpp itself.
@@ -28,16 +26,18 @@ build_one() {
     PREFIX="$1"; OUT="$2"; ARCHDIR="$3"
     OPUSLIB="opus-build-${ARCHDIR}/libopus.a"
     if [ -f "$OPUSLIB" ]; then
-        "$PREFIX-g++" -o "$OUT" win-loopback-native.cpp "$@" \
+        # shellcheck disable=SC2086
+        "$PREFIX-g++" -o "$OUT" win-loopback-native.cpp $CXXFLAGS \
             -DDA_BUILD_OPUS -I"opus-build-${ARCHDIR}/include" "$OPUSLIB" -lwinmm -lole32
     else
         echo "note: $OPUSLIB not found - building WITHOUT Opus (ADPCM only)"
-        "$PREFIX-g++" -o "$OUT" win-loopback-native.cpp "$@" -lole32
+        # shellcheck disable=SC2086
+        "$PREFIX-g++" -o "$OUT" win-loopback-native.cpp $CXXFLAGS -lole32
     fi
 }
 
-build_one x86_64-w64-mingw32 deskaudio-x64.exe x86_64 "$@"
-build_one i686-w64-mingw32   deskaudio-x86.exe i686 "$@"
+build_one x86_64-w64-mingw32 deskaudio-x64.exe x86_64
+build_one i686-w64-mingw32   deskaudio-x86.exe i686
 
 echo "built:"
 ls -la deskaudio-x64.exe deskaudio-x86.exe
