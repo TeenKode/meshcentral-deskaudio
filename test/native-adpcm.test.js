@@ -18,7 +18,8 @@ const path = require("node:path");
 const agent = require(path.join(__dirname, "..", "modules_meshcore", "deskaudio.js"));
 const FIXTURE = path.join(__dirname, "fixtures", "native-adpcm.hex");
 
-// The same deterministic signal as helpers/adpcm-test.c (LCG + tones).
+// The same deterministic integer signal as helpers/adpcm-test.c (LCG, no
+// floating point anywhere, so both sides agree bit for bit by construction).
 function makeSignal() {
     let seed = 12345;
     const lcg = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed; };
@@ -26,12 +27,10 @@ function makeSignal() {
     const blocks = [];
     let cur = [];
     for (let i = 0; i < N; i++) {
-        const t = i;
-        let v = 12000 * Math.sin(2 * Math.PI * t / 32)
-              + 4000 * Math.sin(2 * Math.PI * t / 7)
-              + ((lcg() % 400) - 200);
+        let v = (lcg() % 65536) - 32768
+              + Math.trunc((lcg() % 32768) * ((Math.trunc(i / 64) % 2) ? 1 : -1) / 256);
         if (v > 32767) v = 32767; if (v < -32768) v = -32768;
-        cur.push(Math.round(v));
+        cur.push(v);
         if (cur.length === BLOCK && blocks.length * BLOCK + BLOCK <= N) { blocks.push(cur); cur = []; }
     }
     return blocks;

@@ -20,7 +20,9 @@
 
 #include "adpcm-enc.h"
 
-/* Deterministic LCG, identical to the one in test/native-adpcm.test.js. */
+/* Deterministic LCG, identical to the one in test/native-adpcm.test.js.
+ * Pure-integer signal: no floating point, so the bits are identical under
+ * cc and under Node whatever their sin() implementations do. */
 static unsigned int seed = 12345;
 static unsigned int lcg(void) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed; }
 
@@ -29,13 +31,11 @@ int main(int argc, char** argv) {
     const int N = 2000;   /* ~125 ms at 16 kHz: many blocks, varied dynamics */
     short in[N];
     for (int i = 0; i < N; i++) {
-        double t = (double)i;
-        double v = 12000.0 * sin(2.0 * 3.14159265358979323846 * t / 32.0)      /* tone */
-                 + 4000.0 * sin(2.0 * 3.14159265358979323846 * t / 7.0)        /* +harmonic */
-                 + (double)((int)(lcg() % 400) - 200);                    /* +noise */
-        if (v > 32767.0) v = 32767.0;
-        if (v < -32768.0) v = -32768.0;
-        in[i] = (short)floor(v + 0.5);   /* JS Math.round rounds half up, not to even */
+        int v = (int)(lcg() % 65536) - 32768 +                                /* noise, full range */
+                (int)(lcg() % 32768) * ((i / 64) % 2 ? 1 : -1) / 256;         /* slow sweep */
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        in[i] = (short)v;
     }
 
     int block = 640;                     /* one 40 ms frame at 16 kHz */
