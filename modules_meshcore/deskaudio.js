@@ -409,7 +409,7 @@ function stopCapture(silent) {
         try { c.kill(); } catch (e) { }
         if (process.platform == 'linux') {
             // the shell wrapper may leave parec behind
-            try { require('child_process').execFile('/usr/bin/pkill', ['pkill', '-f', 'client-name=deskaudio']); } catch (e) { }
+            try { require('child_process').execFile('/usr/bin/pkill', ['pkill', '-f', 'deskaudio-capture']); } catch (e) { }
         }
         if (!silent) send({ pluginaction: 'status', sid: sid, state: 'stopped', code: 'stopped' });
     }
