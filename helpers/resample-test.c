@@ -35,30 +35,30 @@ static double rms_db(const short* buf, size_t n) {
     return 20.0 * log10(sqrt(s / (double)n) / 32768.0 + 1e-30);
 }
 
-/* 20*log10 RMS error between `out` and a reference sine (`freq`, output rate
- * `dst`), after finding the best time offset by brute-force correlation over
- * +/- `maxlag` samples. This absorbs the resampler's group delay without
- * hard-coding it. Returns the error in dB. */
+/* Passband check without phase bookkeeping: the resampler's output for a
+ * pure 1 kHz tone must be a pure 1 kHz tone. Demodulate against a reference
+ * sine and cosine at exactly 1 kHz (a Goertzel-style detector): the error is
+ * everything that is not the tone itself. This measures distortion and
+ * stopband leakage without needing to know the group delay. */
 static double tone_err_db(const short* out, size_t n, double freq, spx_uint32_t dst) {
-    size_t win = (n / 4 < 1000) ? (n / 4) : 1000;   /* correlation window */
-    long maxlag = 64;
-    if (n <= (size_t)(2 * maxlag) + win + 8) return -1e30;
-
-    double best_e = 1e30;
-    for (long lag = -maxlag; lag <= maxlag; lag++) {
-        double s = 0.0;
-        size_t cnt = 0;
-        size_t i0 = (size_t)(n / 2) + lag;
-        for (size_t i = 0; i < win; i++, cnt++) {
-            double t = ((double)((long)i + lag) + 0.0) / (double)dst;
-            double ref = 32767.0 * sin(2.0 * M_PI * freq * t);
-            double got = out[i0 + i];
-            s += (got - ref) * (got - ref);
-        }
-        double e = sqrt(s / (double)cnt);
-        if (e < best_e) best_e = e;
+    (void)freq; (void)dst;
+    if (n < 64) return -1e30;
+    /* amplitude at the tone frequency via correlation with sin/cos of the
+       KNOWN output frequency 1000 Hz at 16000 Hz -> exactly 16 samples per
+       period, an integer, so any window aligned to 16 gives a clean DFT bin. */
+    double ss = 0.0, sc = 0.0, energy = 0.0;
+    size_t win = (n / 16) * 16;          /* whole periods only */
+    size_t skip = n / 8;                 /* skip the filter's settling tail */
+    for (size_t i = skip; i < skip + win; i++) {
+        double ph = 2.0 * M_PI * 1000.0 * (double)i / 16000.0;
+        ss += out[i] * sin(ph);
+        sc += out[i] * cos(ph);
+        energy += (double)out[i] * out[i];
     }
-    return 20.0 * log10(best_e / 32768.0 + 1e-30);
+    double amp = 2.0 * sqrt(ss * ss + sc * sc) / (double)win;
+    double rms = sqrt(energy / (double)win);
+    double err = sqrt(rms * rms - (amp / sqrt(2.0)) * (amp / sqrt(2.0)) + 1e-30);
+    return 20.0 * log10(err / 32768.0 + 1e-30);
 }
 
 /* Feed `n` samples of a sine through the resampler, return output length. */
