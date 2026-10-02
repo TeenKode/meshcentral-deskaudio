@@ -248,7 +248,7 @@ function startWin(a) {
     // emulation exists only on Windows 11).
     var arch = process.env['PROCESSOR_ARCHITEW6432'] || process.env['PROCESSOR_ARCHITECTURE'];
     var exeB64 = (arch == 'AMD64') ? a.exe64 : a.exe32;
-    if (!exeB64) exeB64 = a.exe32;
+    if (!exeB64) exeB64 = a.exe32 || a.exe64;   // no arch env (or one build only): either will do
     if (!exeB64) return fail('Нет хелпера для Windows', 'no_helpers');
     var data = Buffer.from(exeB64, 'base64');
     // A second name is used if the first is locked (e.g. a previous capture is
