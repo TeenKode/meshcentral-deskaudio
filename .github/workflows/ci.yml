@@ -70,6 +70,27 @@ jobs:
           cc -O2 -Wall -o /tmp/opus-test helpers/opus-test.c -lopus -lm
           /tmp/opus-test
 
+  # Real-browser playback check: Chromium decodes Opus with WebCodecs and plays
+  # it through the AudioWorklet; the recorded output must have no gaps.
+  browser-e2e:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install libopus and Playwright Chromium
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev
+          npm install --no-save playwright@1.56.1
+          npx playwright install --with-deps chromium
+      - name: Opus playback has no gaps
+        run: |
+          cc -O2 -o /tmp/opus-packets test/e2e/opus-packets.c -lopus -lm
+          /tmp/opus-packets > /tmp/packets.bin
+          node test/e2e/opus-playback.js /tmp/packets.bin opus2
+          node test/e2e/opus-playback.js /tmp/packets.bin opus
+
   shellcheck:
     runs-on: ubuntu-latest
     steps:

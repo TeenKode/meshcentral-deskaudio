@@ -160,20 +160,17 @@ test("the AudioContext is created at the agent's rate on the first chunk", () =>
     assert.deepStrictEqual(ctx.ctorOpts, { sampleRate: 24000 });
 });
 
-test("a rate the context cannot honor falls back to the default context", () => {
+test("a context the browser opens at another rate is kept (the player resamples)", () => {
     const { obj } = loadPlugin();
     const ctx = makeWorkletCtx(48000);       // hardware clamps: we get 48k back
-    let asked = 0, fallback = 0;
-    const AC = function (opts) {
-        if (opts && opts.sampleRate === 24000) { asked++; return ctx; }
-        if (!opts) { fallback++; return ctx; }   // the fallback constructor
-        throw new Error("unexpected");
-    };
-    withBrowser(obj, { active: true, AC, gain: { connect() {} }, nodeid: "node//pc1", next: 0 }, () => {
+    let calls = 0;
+    const AC = function (opts) { calls++; return ctx; };
+    const state = { active: true, AC, gain: { connect() {} }, nodeid: "node//pc1", next: 0 };
+    withBrowser(obj, state, () => {
         obj.onChunk({ nodeid: "node//pc1", rate: 24000, d: pcmBase64([1, 2, 3, 4]) });
     });
-    assert.strictEqual(asked, 1, "the preferred rate was requested first");
-    assert.strictEqual(fallback, 1, "the default context was used as the fallback");
+    assert.strictEqual(calls, 1, "one context, no close-and-reopen");
+    assert.strictEqual(state.pending[0].rate, 24000, "audio keeps its own rate for the player");
 });
 
 test("audio decoded while the worklet module loads is flushed into it", async () => {
@@ -196,8 +193,11 @@ test("audio decoded while the worklet module loads is flushed into it", async ()
         await new Promise((r) => setImmediate(r));    // addModule resolved
         assert.ok(node, "the worklet node was created");
         assert.strictEqual(node.name, "deskaudio-processor");
-        assert.strictEqual(node.port.messages.length, 1, "the held chunk was flushed");
-        assert.deepStrictEqual(Array.from(node.port.messages[0].s), [10 / 32768, 20 / 32768, 30 / 32768]);
+        const audio = node.port.messages.filter((m) => m.s);
+        assert.strictEqual(audio.length, 1, "the held chunk was flushed");
+        assert.strictEqual(audio[0].rate, 16000);
+        assert.deepStrictEqual(Array.from(audio[0].s), [10 / 32768, 20 / 32768, 30 / 32768].map(Math.fround));
+        assert.ok(node.port.messages.some((m) => m.jitter > 0), "the player got the jitter setting");
     } finally {
         delete global.AudioWorkletNode;
     }

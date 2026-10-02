@@ -14,7 +14,7 @@ module.exports.deskaudio = function (parent) {
     var obj = {};
     obj.parent = parent;
     obj.meshServer = parent.parent;
-    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setCompress', 'setRate', 'setCodec', 'setBitrate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_ringNew', '_ringPush', 'probeCodecs', '_ensureCtx', '_ensureOpusDecoder', '_pushDecoded', '_opusChunk'];
+    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setRate', 'setCodec', 'setBitrate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_playerCore', 'probeCodecs', '_ensureCtx', '_ensureOpusDecoder', '_pushDecoded', '_opusChunk', '_teardown'];
 
     var fs = require('fs');
     var path = require('path');
@@ -284,6 +284,9 @@ module.exports.deskaudio = function (parent) {
             logEvent(sess, node, 'Прослушивание звука рабочего стола: начало');
             var consent = consentInfo(consentFlags(web, domain, node, sess.user), domain, sess.user);
 
+            if (st && st.codec === 'opus' && Array.isArray(command.codecs) && command.codecs.indexOf('opus') < 0)
+                return sendStatus(sess, nodeid, 'error', 'codec_mismatch', 'Звук этого устройства уже передаётся в Opus, а этот браузер (или выбранный кодек) его не поддерживает');
+
             if (st) {
                 // Joining a running capture. If the device requires consent, the
                 // local user is asked again for this new listener.
@@ -310,20 +313,21 @@ module.exports.deskaudio = function (parent) {
                 consent: consent.prompt || consent.notify, ready: false, rate: rate
             };
             attach(st, sess);
-            // Codec negotiation: the browser lists what it can decode
-            // (WebCodecs AudioDecoder for opus, else adpcm/pcm always work).
-            // The agent confirms what it actually started in its 'started'
-            // status, and every chunk carries its codec, so the browser
-            // always decodes what it receives.
-            var codec = (command.codecs && command.codecs.indexOf('opus') >= 0) ? 'opus' : null;
-            var st2 = streams[nodeid];
-            st2.codec = codec;
+            // Codec negotiation: the browser lists what it can decode (opus via
+            // WebCodecs; adpcm/pcm always). The agent confirms what it actually
+            // started in its 'started' status, and every chunk carries its
+            // codec, so the browser always decodes what it receives.
+            var codecs = Array.isArray(command.codecs) ? command.codecs : null;
+            st.codec = (codecs && codecs.indexOf('opus') >= 0) ? 'opus' : null;
+            // An explicit ['pcm'] means uncompressed, whatever `compress` says.
+            var compress = command.compress !== false &&
+                !(codecs && codecs.indexOf('pcm') >= 0 && codecs.indexOf('adpcm') < 0 && codecs.indexOf('opus') < 0);
             var bitrate = parseInt(command.bitrate, 10);
             if ([24, 32, 48].indexOf(bitrate) < 0) bitrate = 32;
             sendAgent(agent, {
                 pluginaction: 'start', sid: st.sid, rate: rate,
-                compress: command.compress !== false, silence: command.silence !== false,
-                codec: codec, bitrate: bitrate,
+                compress: compress, silence: command.silence !== false,
+                codec: st.codec, bitrate: bitrate,
                 consent: consent, script: h.script,
                 exe64: h.exe64, ver64: h.ver64, exe32: h.exe32, ver32: h.ver32
             });
@@ -351,7 +355,7 @@ module.exports.deskaudio = function (parent) {
                 if (st.consent && !st.ready) return;
                 var rate = parseInt(command.rate, 10);
                 if ([8000, 16000, 24000].indexOf(rate) < 0) return;
-                var codec = (command.codec === 'adpcm' || command.codec === 'opus') ? command.codec : undefined;
+                var codec = (command.codec === 'adpcm' || command.codec === 'opus' || command.codec === 'opus2') ? command.codec : undefined;
                 st.listeners.forEach(function (s) { sendUser(s, { method: 'onChunk', nodeid: nodeid, rate: rate, codec: codec, d: command.d }); });
                 break;
             case 'status':
@@ -369,6 +373,7 @@ module.exports.deskaudio = function (parent) {
                     }
                     st.ready = true;
                     if (command.rate) st.rate = command.rate;
+                    if (command.codec) st.codec = (command.codec === 'opus') ? 'opus' : null;   // what the agent really runs
                 }
                 st.listeners.forEach(function (s) { sendStatus(s, nodeid, state, code, msg, { rate: command.rate, timeout: command.timeout }); });
                 break;
@@ -496,6 +501,7 @@ module.exports.deskaudio = function (parent) {
                 }, 300);
             });
         }
+        P.probeCodecs();
         P.render();
     };
 
@@ -519,29 +525,30 @@ module.exports.deskaudio = function (parent) {
         if ((P._s || {}).active) P.stop(); else P.start();
     };
 
-    // Which codecs this browser can decode. Opus via WebCodecs AudioDecoder
-    // (probe once and cache; the probe is async, so the first start falls
-    // back to adpcm/pcm and later starts can use opus), plus the always-
-    // available software paths.
-    obj.probeCodecs = function () {
+    // Which codecs this browser can decode: opus via WebCodecs AudioDecoder,
+    // plus the always-available software paths. The probe is asynchronous, so
+    // it is warmed up when the tab is built; cb(list) runs once it is known.
+    obj.probeCodecs = function (cb) {
         var P = pluginHandler.deskaudio;
         var s = P._s = P._s || {};
-        if (s.codecCache) return s.codecCache;
-        var list = ['adpcm', 'pcm'];
+        var base = ['adpcm', 'pcm'];
+        if (s.codecCache) { if (cb) cb(s.codecCache); return; }
+        if (typeof AudioDecoder === 'undefined' || typeof EncodedAudioChunk === 'undefined' || !AudioDecoder.isConfigSupported) {
+            s.codecCache = base; if (cb) cb(base); return;
+        }
+        if (cb) (s.codecWaiters = s.codecWaiters || []).push(cb);
+        if (s.codecProbing) return;
+        s.codecProbing = true;
+        function done(list) {
+            s.codecCache = list; s.codecProbing = false;
+            var w = s.codecWaiters || []; s.codecWaiters = [];
+            for (var i = 0; i < w.length; i++) w[i](list);
+        }
         try {
-            if (typeof AudioDecoder !== 'undefined' && AudioDecoder.isConfigSupported) {
-                AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 })
-                    .then(function (r) {
-                        if (r && r.supported) {
-                            s.codecCache = ['opus', 'adpcm', 'pcm'];
-                            // remember for the next start; the current one
-                            // already went out with adpcm-level support
-                        }
-                    }).catch(function () { });
-            }
-        } catch (e) { }
-        return list;
-    }
+            AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 })
+                .then(function (r) { done((r && r.supported) ? ['opus', 'adpcm', 'pcm'] : base); }, function () { done(base); });
+        } catch (e) { done(base); }
+    };
 
     obj.start = function () {
         var P = pluginHandler.deskaudio;
@@ -549,41 +556,42 @@ module.exports.deskaudio = function (parent) {
         if (s.active || typeof currentNode === 'undefined' || !currentNode) return;
         var AC = window.AudioContext || window.webkitAudioContext;
         if (!AC) { s.statusText = 'Браузер не поддерживает Web Audio'; P.render(); return; }
-        // The AudioContext is created lazily in _ensureCtx() on the first
-        // chunk, once the agent's actual sample rate is known: new AC({sampleRate})
-        // then makes the browser run at the agent's rate, so chunks are never
-        // resampled individually (the per-chunk resampling is what clicked at
-        // chunk boundaries).
+        function g(k, d) { try { var v = localStorage.getItem('deskaudio_' + k); return (v === null) ? d : v; } catch (e) { return d; } }
+        var r = document.getElementById('da_rate');
+        var rate = r ? parseInt(r.value, 10) : parseInt(g('rate', '16000'), 10);
+        if ([8000, 16000, 24000].indexOf(rate) < 0) rate = 16000;
+        var codec = g('codec', 'auto');
+        var webCodecs = (typeof AudioDecoder !== 'undefined' && typeof EncodedAudioChunk !== 'undefined');
+        if (codec === 'opus' && !webCodecs) {
+            s.statusText = 'Браузер не поддерживает декодирование Opus — выберите ADPCM в настройках';
+            P.render(); return;
+        }
         var v = document.getElementById('da_vol');
         s.vol = v ? (v.value / 100) : 0.8;
-        s.next = 0;
-        s.pending = [];
-        s.workletReady = false;
+        s.jitter = { low: 0.08, med: 0.15, high: 0.30 }[g('buffer', 'med')] || 0.15;
         s.nodeid = currentNode._id;
         s.active = true;
         s.gotAudio = false;
         s.statusText = 'Подключение…';
+        // Create the AudioContext now, inside the click: Safari only lets a
+        // context start from a user gesture. Its rate is the expected stream
+        // rate; if the agent ends up sending another rate, the player resamples.
+        P._ensureCtx(s, (codec === 'opus' || (codec === 'auto' && webCodecs)) ? 48000 : rate);
         // Don't hang on "Подключение…": if the agent never responds, reset.
         if (s.connectTimer) { clearTimeout(s.connectTimer); }
         s.connectTimer = setTimeout(function () {
             var Pt = pluginHandler.deskaudio, st2 = Pt._s || {};
             if (st2.active && !st2.gotAudio) { Pt.stop(); st2.statusText = 'Нет ответа от агента'; Pt.render(); }
         }, 10000);
-        function g(k, d) { try { var v = localStorage.getItem('deskaudio_' + k); return (v === null) ? d : v; } catch (e) { return d; } }
-        var r = document.getElementById('da_rate');
-        var rate = r ? parseInt(r.value, 10) : parseInt(g('rate', '16000'), 10);
-        var compress = (g('compress', null) !== '0');   // legacy key; codec='pcm' forces raw anyway
-        var silence = (g('silence', '1') !== '0');
-        var jit = { low: 0.08, med: 0.15, high: 0.30 }[g('buffer', 'med')] || 0.15;
-        s.jitter = jit;
-        var pref2 = g('codec', 'auto');
-        var adv = P.probeCodecs();
-        if (pref2 === 'opus') { adv = ['opus']; }
-        else if (pref2 === 'adpcm') { adv = ['adpcm']; }
-        else if (pref2 === 'pcm') { adv = ['pcm']; }
-        s.codecs = adv;
-        var br = parseInt(g('bitrate', '32'), 10);
-        meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'start', nodeid: s.nodeid, rate: rate, compress: compress, silence: silence, codecs: s.codecs, bitrate: br });
+        var msg = { action: 'plugin', plugin: 'deskaudio', pluginaction: 'start', nodeid: s.nodeid, rate: rate,
+                    compress: codec !== 'pcm', silence: g('silence', '1') !== '0', bitrate: parseInt(g('bitrate', '32'), 10) };
+        function send(codecs) {
+            if (!s.active || s.nodeid !== msg.nodeid) return;    // stopped while probing
+            s.codecs = msg.codecs = codecs;
+            meshserver.send(msg);
+        }
+        if (codec === 'opus' || codec === 'adpcm' || codec === 'pcm') send([codec]);
+        else P.probeCodecs(send);
         P.render();
     };
 
@@ -591,12 +599,9 @@ module.exports.deskaudio = function (parent) {
         var P = pluginHandler.deskaudio;
         var s = P._s = P._s || {};
         if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }
-        if (s.nodeid) meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'stop', nodeid: s.nodeid });
-        try { if (s.node) { s.node.disconnect(); s.node.port.onmessage = null; } } catch (e) { }
-        try { if (s.workletUrl) URL.revokeObjectURL(s.workletUrl); } catch (e) { }
-        try { if (s.ctx) s.ctx.close(); } catch (e) { }
-        s.node = null; s.workletUrl = null; s.pending = null; s.workletReady = false;
-        s.ctx = null; s.gain = null; s.active = false; s.statusText = 'Остановлено';
+        if (s.nodeid && s.active) meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'stop', nodeid: s.nodeid });
+        P._teardown(s);
+        s.active = false; s.statusText = 'Остановлено';
         P.render();
     };
 
@@ -610,10 +615,6 @@ module.exports.deskaudio = function (parent) {
     // Remembered per-browser default: auto-listen when connecting to the desktop.
     obj.setAuto = function (on) { try { localStorage.setItem('deskaudio_auto', on ? '1' : '0'); } catch (e) { } };
 
-    // Remembered per-browser default: compress audio (ADPCM) vs. raw PCM. Takes
-    // effect on the next start (stop and start again to switch mid-listen).
-    obj.setCompress = function (on) { try { localStorage.setItem('deskaudio_compress', on ? '1' : '0'); } catch (e) { } };
-
     // More remembered settings (all apply on the next start).
     obj.setRate = function (v) { try { localStorage.setItem('deskaudio_rate', String(v)); } catch (e) { } };
     obj.setCodec = function (v) {
@@ -625,7 +626,12 @@ module.exports.deskaudio = function (parent) {
     };
     obj.setBitrate = function (v) { try { localStorage.setItem('deskaudio_bitrate', String(v)); } catch (e) { } };
     obj.setSilence = function (on) { try { localStorage.setItem('deskaudio_silence', on ? '1' : '0'); } catch (e) { } };
-    obj.setBuffer = function (v) { try { localStorage.setItem('deskaudio_buffer', String(v)); } catch (e) { } };
+    obj.setBuffer = function (v) {
+        try { localStorage.setItem('deskaudio_buffer', String(v)); } catch (e) { }
+        var s = pluginHandler.deskaudio._s || {};
+        s.jitter = { low: 0.08, med: 0.15, high: 0.30 }[v] || 0.15;
+        if (s.node) s.node.port.postMessage({ jitter: s.jitter });      // applies immediately
+    };
 
     // Called by MeshCentral when the remote desktop disconnects. Audio is tied to
     // the desktop session, so stop listening whenever the desktop is closed.
@@ -651,46 +657,99 @@ module.exports.deskaudio = function (parent) {
             }, wt);
         }
         else if (m.state === 'error' || m.state === 'stopped') {
-            try { if (s.ctx) s.ctx.close(); } catch (e) { }
-            s.ctx = null; s.gain = null; s.active = false;
+            P._teardown(s);
+            s.active = false;
             s.statusText = (m.state === 'error' ? 'Ошибка: ' : 'Остановлено. ') + (m.msg || '');
         }
         P.render();
     };
 
-    // ---- Ring buffer (pure functions; the worklet mirrors this logic) ----
-    // One producer (network chunks) and one consumer (the audio thread) at a
-    // fixed sample rate. `buf` is a Float32Array used as a circular queue.
-    // Drift: when the consumer runs dry it repeats the last sample (keeps the
-    // stream continuous when the agent is marginally slower); overflow drops
-    // the oldest samples (never the newest).
-    obj._ringNew = function (capacitySamples) {
-        return { buf: new Float32Array(capacitySamples), cap: capacitySamples, r: 0, w: 0, used: 0, last: 0 };
-    };
-
-    // Push floats onto the ring. If they do not fit, the OLDEST samples are
-    // overwritten. Returns the number of samples dropped.
-    obj._ringPush = function (ring, samples) {
-        var dropped = 0;
-        for (var i = 0; i < samples.length; i++) {
-            if (ring.used === ring.cap) {           // full: drop the oldest
-                ring.r = (ring.r + 1) % ring.cap; ring.used--;
-                dropped++;
-            }
-            ring.buf[ring.w] = samples[i];
-            ring.w = (ring.w + 1) % ring.cap; ring.used++;
+    // ---- Playback core -------------------------------------------------
+    // One implementation, used twice: unit-tested in Node, and injected
+    // verbatim (via toString) into the AudioWorklet. The worklet runs it on
+    // the audio thread, so this must stay self-contained.
+    //
+    //  * jitter buffer: playback starts (and restarts after a gap) only once
+    //    `jitter` seconds are queued, so network jitter doesn't underrun;
+    //  * drift: the agent's clock and the browser's never match exactly; the
+    //    read speed is nudged by at most +-0.5% to hold the fill near target
+    //    (inaudible), and a backlog beyond the cap is skipped in one jump;
+    //  * rate: input at any rate is played at the context rate (linear
+    //    interpolation) - normally they are equal, but a browser may refuse
+    //    AudioContext({sampleRate});
+    //  * gaps (silence suppression, underrun): fade to zero, never hold the
+    //    last sample (a held sample is a DC step = click).
+    obj._playerCore = function () {
+        function Player(outRate) {
+            this.outRate = outRate;
+            this.inRate = 0;
+            this.jitter = 0.15;
+            this.size = 1 << 18;                 // 262144 samples: 5.4 s at 48 kHz
+            this.mask = this.size - 1;
+            this.buf = new Float32Array(this.size);
+            this.w = 0;                          // samples written (absolute)
+            this.r = 0;                          // read position (absolute, fractional)
+            this.playing = false;
+            this.ratio = 1;
+            this.last = 0;
+            this.underruns = 0;
+            this.skips = 0;
         }
-        return dropped;
+        Player.prototype.setJitter = function (sec) { if (sec > 0) this.jitter = sec; };
+        Player.prototype.fill = function () { return this.w - this.r; };
+        Player.prototype.push = function (f, rate) {
+            if (rate && rate !== this.inRate) {      // new stream format: start over
+                this.inRate = rate; this.w = 0; this.r = 0; this.playing = false; this.ratio = 1;
+            }
+            if (!this.inRate) this.inRate = this.outRate;
+            var n = f.length;
+            if (n > this.size / 2) { f = f.subarray(n - this.size / 2); n = f.length; }
+            // Too far behind real time (or about to overrun the ring): drop the
+            // backlog and resume at the target latency.
+            var maxFill = Math.min(this.size / 2, Math.round((this.jitter * 2 + 0.45) * this.inRate));
+            if (this.fill() + n > maxFill) {
+                this.r = Math.max(this.r, this.w + n - Math.round(this.jitter * this.inRate));
+                this.skips++;
+            }
+            for (var i = 0; i < n; i++) this.buf[(this.w + i) & this.mask] = f[i];
+            this.w += n;
+        };
+        Player.prototype.render = function (out) {
+            var len = out.length, i = 0;
+            if (!this.inRate) { for (; i < len; i++) out[i] = 0; return; }
+            var target = this.jitter * this.inRate;
+            if (!this.playing) {
+                if (this.fill() >= target) { this.playing = true; this.ratio = 1; }
+                else { this.fadeOut(out, 0); return; }
+            }
+            // Drift control: fill above target -> read slightly faster.
+            var err = (this.fill() - target) / target;
+            if (err > 1) err = 1; else if (err < -1) err = -1;
+            this.ratio += ((1 + 0.005 * err) - this.ratio) * 0.01;
+            var step = this.inRate / this.outRate * this.ratio;
+            for (; i < len; i++) {
+                if (this.w - this.r < 2) {                // ran dry: rebuffer
+                    this.playing = false; this.underruns++;
+                    this.fadeOut(out, i);
+                    return;
+                }
+                var p = Math.floor(this.r), fr = this.r - p;
+                var a = this.buf[p & this.mask], b = this.buf[(p + 1) & this.mask];
+                var v = a + (b - a) * fr;
+                out[i] = v; this.last = v;
+                this.r += step;
+            }
+        };
+        // Ramp from the last output to silence over ~2.7 ms, then zeros.
+        Player.prototype.fadeOut = function (out, from) {
+            for (var i = from; i < out.length; i++) {
+                this.last *= 0.98;
+                if (this.last > -1e-4 && this.last < 1e-4) this.last = 0;
+                out[i] = this.last;
+            }
+        };
+        return Player;
     };
-
-    // Pull up to `n` samples; returns a Float32Array (possibly shorter).
-    function ringPull(ring, n) {
-        var take = Math.min(n, ring.used);
-        var out = new Float32Array(take);
-        for (var i = 0; i < take; i++) { out[i] = ring.buf[ring.r]; ring.r = (ring.r + 1) % ring.cap; }
-        ring.used -= take;
-        return out;
-    }
 
     // IMA ADPCM decoder — mirrors modules_meshcore/deskaudio.js adpcmEncode().
     obj._adpcmDecode = function (bin) {
@@ -730,152 +789,76 @@ module.exports.deskaudio = function (parent) {
         return out;
     };
 
-    // Create the AudioContext at the agent's actual rate on the first chunk,
-    // then wire up the worklet (or the fallback scheduler). The rate is known
-    // only here, not in start(). Exported: serialized browser code (onChunk)
-    // calls it via pluginHandler.deskaudio._ensureCtx.
+    // Create the AudioContext at the stream's rate on the first chunk (the
+    // rate is known only then), and the worklet player. Exported: serialized
+    // browser code calls it via pluginHandler.deskaudio._ensureCtx.
     obj._ensureCtx = function (s, rate) {
         if (s.ctx) return;
+        var P = pluginHandler.deskaudio;
         var AC = window.AudioContext || window.webkitAudioContext;
         if (!AC) return;
-        // 7a: ask for the agent's rate. If the browser refuses (or silently
-        // clamps to its hardware rate), fall back to the default context —
-        // the browser then resamples each createBuffer() internally, which is
-        // the old behavior, still click-free at chunk boundaries because the
-        // fallback scheduler is sample-continuous.
-        try {
-            s.ctx = new AC({ sampleRate: rate });
-            if (s.ctx.sampleRate && Math.abs(s.ctx.sampleRate - rate) > 1) {
-                try { s.ctx.close(); } catch (e) { }
-                s.ctx = null;
-            }
-        } catch (e) { s.ctx = null; }
+        // Ask for the stream's rate so nothing is resampled. A browser that
+        // refuses keeps its own rate; the player then resamples.
+        try { s.ctx = new AC({ sampleRate: rate }); } catch (e) { s.ctx = null; }
         if (!s.ctx) { try { s.ctx = new AC(); } catch (e) { return; } }
-        if (s.ctx.resume) s.ctx.resume();       // allowed: a user gesture started this
+        if (s.ctx.resume) s.ctx.resume();
         s.gain = s.ctx.createGain();
         s.gain.gain.value = (s.vol !== undefined) ? s.vol : 0.8;
         s.gain.connect(s.ctx.destination);
-
-        // 7b: AudioWorklet + ring buffer — seamless chunk boundaries and
-        // clock-drift absorption. Blob URL because the plugin cannot serve
-        // its own files.
-        var cap = Math.max(128, Math.round((s.jitter || 0.15) * rate * 4));   // ~4x the jitter buffer
-        var code = ("class DeskAudioProcessor extends AudioWorkletProcessor {" +
-        "  constructor() {" +
-        "    super();" +
-        "    this.ring = new Float32Array(RCAP);" +
-        "    this.r = 0; this.w = 0; this.used = 0; this.last = 0; this.fill = 0;" +
-        "    this.port.onmessage = (e) => {" +
-        "      const d = e.data;" +
-        "      if (d.cmd === 'push') { const s = d.s;" +
-        "        for (let i = 0; i < s.length; i++) {" +
-        "          if (this.used === RCAP) { this.r = (this.r + 1) % RCAP; this.used--; }" +
-        "          this.ring[this.w] = s[i]; this.w = (this.w + 1) % RCAP; this.used++;" +
-        "        }" +
-        "        this.fill = this.used / RCAP;" +
-        "        this.port.postMessage({ fill: this.fill });" +
-        "      }" +
-        "    };" +
-        "  }" +
-        "  process(inputs, outputs) {" +
-        "    const out = outputs[0][0];" +
-        "    for (let i = 0; i < out.length; i++) {" +
-        "      if (this.used > 0) {" +
-        "        out[i] = this.ring[this.r]; this.last = out[i];" +
-        "        this.r = (this.r + 1) % RCAP; this.used--;" +
-        "      } else { out[i] = this.last; }" +
-        "    }" +
-        "    this.fill = this.used / RCAP;" +
-        "    return true;" +
-        "  }" +
-        "}" +
-        "registerProcessor('deskaudio-processor', DeskAudioProcessor);").replace(/RCAP/g, String(cap));
-        if (!s.pending) s.pending = [];
+        s.next = 0;
+        s.pending = [];
         if (s.ctx.audioWorklet && typeof Blob !== 'undefined' && typeof URL !== 'undefined' && URL.createObjectURL) {
+            var code = 'var Player = (' + P._playerCore.toString() + ')();\n' +
+                'class DeskAudioProcessor extends AudioWorkletProcessor {\n' +
+                '  constructor() { super(); this.p = new Player(sampleRate);\n' +
+                '    this.port.onmessage = (e) => { const d = e.data;\n' +
+                '      if (d.jitter) this.p.setJitter(d.jitter);\n' +
+                '      if (d.s) this.p.push(d.s, d.rate); }; }\n' +
+                '  process(inputs, outputs) { this.p.render(outputs[0][0]); return true; }\n' +
+                '}\n' +
+                "registerProcessor('deskaudio-processor', DeskAudioProcessor);\n";
             try {
+                var ctx = s.ctx;
                 var url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
                 s.workletUrl = url;
-                s.ctx.audioWorklet.addModule(url).then(function () {
-                    if (!s.ctx) return;
-                    s.node = new AudioWorkletNode(s.ctx, 'deskaudio-processor');
-                    s.node.port.onmessage = function (e) { if (s.node && e.data && e.data.fill !== undefined) s.fill = e.data.fill; };
+                ctx.audioWorklet.addModule(url).then(function () {
+                    if (s.ctx !== ctx) return;              // stopped meanwhile
+                    s.node = new AudioWorkletNode(ctx, 'deskaudio-processor', { numberOfInputs: 0, outputChannelCount: [1] });
                     s.node.connect(s.gain);
-                    s.workletReady = true;
-                    // Audio decoded before the module finished loading: flush it.
-                    if (s.pending && s.pending.length) {
-                        for (var i = 0; i < s.pending.length; i++) {
-                            var cp = Float32Array.from(s.pending[i]);
-                            s.node.port.postMessage({ cmd: 'push', s: cp });
-                        }
-                    }
+                    s.node.port.postMessage({ jitter: s.jitter || 0.15 });
+                    var q = s.pending || [];
                     s.pending = null;
-                }).catch(function () { s.workletReady = false; s.pending = null; });
-            } catch (e) { s.workletReady = false; s.pending = null; }
-        } else {
-            s.workletReady = false;
-            s.pending = null;
+                    for (var i = 0; i < q.length; i++) s.node.port.postMessage({ s: q[i].f, rate: q[i].rate }, [q[i].f.buffer]);
+                }).catch(function () { if (s.ctx === ctx) s.pending = null; });   // -> fallback scheduler
+                return;
+            } catch (e) { }
         }
-        s.next = 0;
-    }
+        s.pending = null;                               // no AudioWorklet: fallback scheduler
+    };
 
-    // Opus decode path: WebCodecs AudioDecoder. The frame payload is
-    // [dur:2 LE][opus packet]; decoded 48 kHz mono PCM goes into the same
-    // worklet ring buffer as ADPCM/PCM (the worklet is rate-agnostic - it
-    // just plays what arrives at the context's rate).
-    obj._ensureOpusDecoder = function (s) {
-        if (s.opusDec || s.opusDecFailed) return s.opusDec;
-        try {
-            if (typeof AudioDecoder === 'undefined') { s.opusDecFailed = true; return null; }
-            s.opusChunks = [];
-            s.opusDec = new AudioDecoder({
-                output: function (frame) {
-                    // f32-planar mono is what our configure() requests; copy
-                    // plane 0 and push it into the ring.
-                    var st = (pluginHandler.deskaudio._s || {});
-                    try {
-                        var plane = new Float32Array(frame.allocationSize({ planeIndex: 0, format: 'f32-planar' }));
-                        frame.copyTo(plane, { planeIndex: 0, format: 'f32-planar' });
-                        pluginHandler.deskaudio._pushDecoded(st, plane, 48000);
-                    } catch (e) { }
-                    try { frame.close(); } catch (e) { }
-                },
-                error: function (e) {
-                    var P = pluginHandler.deskaudio, st = P._s || {};
-                    st.opusDecFailed = true;
-                    try { if (st.opusDec) st.opusDec.close(); } catch (e2) { }
-                    st.opusDec = null;
-                    // The stream keeps flowing: the agent is asked (via the
-                    // next start) to fall back... for now, stop cleanly.
-                    try { P.stop(); } catch (e2) { }
-                }
-            });
-            s.opusDec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
-        } catch (e) { s.opusDecFailed = true; return null; }
-        return s.opusDec;
-    }
-
-    // Decoded PCM from any codec goes to the worklet ring (or the fallback
-    // scheduler) at its own rate.
+    // Decoded PCM from any codec, at its own rate: to the worklet player (or,
+    // without AudioWorklet, the buffer-source scheduler) and the level meter.
     obj._pushDecoded = function (s, f32, rate) {
+        var n = f32.length;
+        if (!n || !s.ctx) return;
         var sum = 0;
-        for (var i = 0; i < f32.length; i++) sum += f32[i] * f32[i];
+        for (var i = 0; i < n; i++) sum += f32[i] * f32[i];
         if (!s.gotAudio) {
             s.gotAudio = true;
             if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }
-            s.statusText = 'Идёт передача звука (Opus 48 кГц)';
+            s.statusText = 'Идёт передача звука (' + (s.codecName || '') + (s.codecName ? ', ' : '') + (rate / 1000) + ' кГц)';
             pluginHandler.deskaudio.render();
         }
-        if (s.workletReady && s.node) {
-            var cp = Float32Array.from(f32);
-            s.node.port.postMessage({ cmd: 'push', s: cp }, [cp.buffer]);
-        } else if (s.ctx.audioWorklet && s.pending !== null) {
-            if (!s.pending) s.pending = [];
-            s.pending.push(f32);
+        if (s.node) {
+            var cp = new Float32Array(f32);          // own copy: its buffer is transferred
+            s.node.port.postMessage({ s: cp, rate: rate }, [cp.buffer]);
+        } else if (s.pending) {
+            s.pending.push({ f: new Float32Array(f32), rate: rate });   // worklet still loading
         } else {
             var jit = s.jitter || 0.15;
             var ctx = s.ctx, now = ctx.currentTime;
-            if (s.next - now > jit * 2 + 0.45) return;
-            var buf = ctx.createBuffer(1, f32.length, rate);
+            if (s.next - now > jit * 2 + 0.45) return;  // too far behind real time: drop
+            var buf = ctx.createBuffer(1, n, rate);
             buf.copyToChannel(f32, 0);
             var src = ctx.createBufferSource();
             src.buffer = buf;
@@ -885,93 +868,111 @@ module.exports.deskaudio = function (parent) {
             s.next += buf.duration;
         }
         var bar = document.getElementById('da_bar');
-        if (bar) bar.style.width = Math.min(100, Math.round(Math.sqrt(sum / f32.length) * 300)) + '%';
-    }
+        if (bar) bar.style.width = Math.min(100, Math.round(Math.sqrt(sum / n) * 300)) + '%';
+    };
 
-    // One opus chunk from the agent: [dur:2][packet] -> AudioDecoder.
-    obj._opusChunk = function (s, bin) {
-        var dec = pluginHandler.deskaudio._ensureOpusDecoder(s);
+    // Opus decode path: WebCodecs AudioDecoder.
+    obj._ensureOpusDecoder = function (s) {
+        if (s.opusDec) return s.opusDec;
+        if (typeof AudioDecoder === 'undefined' || typeof EncodedAudioChunk === 'undefined') return null;
+        try {
+            var dec = new AudioDecoder({
+                output: function (frame) {
+                    var st = pluginHandler.deskaudio._s || {};
+                    try {
+                        if (st.opusDec === dec) {
+                            // NB: allocationSize() is in BYTES; the plane holds
+                            // numberOfFrames float samples (mono).
+                            var plane = new Float32Array(frame.numberOfFrames);
+                            frame.copyTo(plane, { planeIndex: 0, format: 'f32-planar' });
+                            pluginHandler.deskaudio._pushDecoded(st, plane, frame.sampleRate || 48000);
+                        }
+                    } catch (e) { }
+                    try { frame.close(); } catch (e) { }
+                },
+                error: function () {
+                    var P = pluginHandler.deskaudio, st = P._s || {};
+                    if (st.opusDec !== dec) return;
+                    P.stop();
+                    st.statusText = 'Ошибка декодирования Opus — выберите ADPCM в настройках';
+                    P.render();
+                }
+            });
+            dec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+            s.opusDec = dec;
+            s.opusTs = 0;
+        } catch (e) { return null; }
+        return s.opusDec;
+    };
+
+    // One opus chunk from the agent. Payload: a sequence of packets, each
+    // [dur:2 LE][len:2 LE][packet] ('opus2'), or a single [dur:2 LE][packet]
+    // ('opus', agents up to 1.0.3). dur is in 48 kHz samples.
+    obj._opusChunk = function (s, bin, multi) {
+        var P = pluginHandler.deskaudio;
+        var dec = P._ensureOpusDecoder(s);
         if (!dec) {
-            // Opus was negotiated but this browser cannot decode it (no
-            // WebCodecs): say so instead of hanging on "Подключение…".
-            s.active = false;
+            P.stop();
             s.statusText = 'Браузер не поддерживает декодирование Opus — выберите ADPCM в настройках';
-            pluginHandler.deskaudio.render();
+            P.render();
             return;
         }
-        if (bin.length < 2) return;
-        var dur = bin.charCodeAt(0) | (bin.charCodeAt(1) << 8);
-        var pkt = bin.substring(2);
-        if (dur <= 0 || pkt.length === 0) return;
-        var u8 = new Uint8Array(pkt.length);
-        for (var i = 0; i < pkt.length; i++) u8[i] = pkt.charCodeAt(i) & 0xFF;
-        // Opus packets are not AudioData (that is a PCM container): they go
-        // in as EncodedAudioChunk. timestamp must be monotonically increasing
-        // (in microseconds), or decoders drop or reorder the chunks.
-        if (s.opusTs === undefined) s.opusTs = 0;
-        try {
-            dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: s.opusTs, duration: dur * 1000000 / 48000, data: u8 }));
-            s.opusTs += dur * 1000000 / 48000;
-        } catch (e) { }
-    }
+        var pos = 0;
+        while (pos + 2 <= bin.length) {
+            var dur = bin.charCodeAt(pos) | (bin.charCodeAt(pos + 1) << 8);
+            var len;
+            if (multi) {
+                if (pos + 4 > bin.length) return;
+                len = bin.charCodeAt(pos + 2) | (bin.charCodeAt(pos + 3) << 8);
+                pos += 4;
+            } else { pos += 2; len = bin.length - pos; }
+            if (len <= 0 || pos + len > bin.length || dur <= 0) return;
+            var u8 = new Uint8Array(len);
+            for (var i = 0; i < len; i++) u8[i] = bin.charCodeAt(pos + i) & 0xFF;
+            pos += len;
+            var us = dur * 1000000 / 48000;
+            try { dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: s.opusTs, duration: us, data: u8 })); } catch (e) { }
+            s.opusTs += us;
+        }
+    };
 
     obj.onChunk = function (a, b) {
         var m = (b !== undefined && b !== null) ? b : a;
-        var s = (pluginHandler.deskaudio._s || {});
+        var P = pluginHandler.deskaudio;
+        var s = (P._s || {});
         if (!s.active || !m || m.nodeid !== s.nodeid || typeof m.d !== 'string') return;
-        var rate = m.rate || 16000;
-        if (m.codec === 'opus') rate = 48000;    // opus packets are 48 kHz native
-        pluginHandler.deskaudio._ensureCtx(s, rate);
+        var opus = (m.codec === 'opus' || m.codec === 'opus2');
+        var rate = opus ? 48000 : (m.rate || 16000);
+        P._ensureCtx(s, rate);
         if (!s.ctx) return;
         var bin = atob(m.d);
-        var f, sum = 0, i;
-        if (m.codec === 'opus') { pluginHandler.deskaudio._opusChunk(s, bin); return; }
+        if (opus) { s.codecName = 'Opus'; P._opusChunk(s, bin, m.codec === 'opus2'); return; }
+        var f, i;
         if (m.codec === 'adpcm') {
-            f = pluginHandler.deskaudio._adpcmDecode(bin);
-            if (!f || f.length === 0) return;
-            for (i = 0; i < f.length; i++) sum += f[i] * f[i];
+            s.codecName = 'ADPCM';
+            f = P._adpcmDecode(bin);
         } else {
+            s.codecName = 'PCM';
             var n0 = bin.length >> 1;
-            if (n0 === 0) return;
             f = new Float32Array(n0);
             for (i = 0; i < n0; i++) {
                 var v = (bin.charCodeAt(2 * i + 1) << 8) | bin.charCodeAt(2 * i);
                 if (v & 0x8000) v -= 0x10000;
                 f[i] = v / 32768;
-                sum += f[i] * f[i];
             }
         }
-        var n = f.length;
-        if (!s.gotAudio) {
-            s.gotAudio = true;
-            if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }
-            s.statusText = 'Идёт передача звука (' + (rate / 1000) + ' кГц)';
-            pluginHandler.deskaudio.render();
-        }
+        if (!f || f.length === 0) return;
+        P._pushDecoded(s, f, rate);
+    };
 
-        if (s.workletReady && s.node) {
-            // Seamless path: push into the worklet's ring buffer.
-            var cp = Float32Array.from(f);   // copy: the posted buffer may be transferred
-            s.node.port.postMessage({ cmd: 'push', s: cp }, [cp.buffer]);
-        } else if (s.ctx.audioWorklet && s.pending !== null) {
-            // Module still loading: hold the decoded audio until it is ready.
-            s.pending.push(f);
-        } else {
-            // Fallback (old scheduler) when AudioWorklet is unavailable.
-            var jit = s.jitter || 0.15;
-            var ctx = s.ctx, now = ctx.currentTime;
-            if (s.next - now > jit * 2 + 0.45) return;   // too far behind real time: drop
-            var buf = ctx.createBuffer(1, n, rate);
-            buf.copyToChannel(f, 0);
-            var src = ctx.createBufferSource();
-            src.buffer = buf;
-            src.connect(s.gain);
-            if (s.next < now + 0.02) s.next = now + jit;
-            src.start(s.next);
-            s.next += buf.duration;
-        }
-        var bar = document.getElementById('da_bar');
-        if (bar) bar.style.width = Math.min(100, Math.round(Math.sqrt(sum / n) * 300)) + '%';
+    // Release everything playback-related (worklet, decoder, context).
+    obj._teardown = function (s) {
+        try { if (s.node) { s.node.disconnect(); s.node.port.onmessage = null; } } catch (e) { }
+        try { if (s.workletUrl) URL.revokeObjectURL(s.workletUrl); } catch (e) { }
+        try { if (s.opusDec && s.opusDec.state !== 'closed') s.opusDec.close(); } catch (e) { }
+        try { if (s.ctx) s.ctx.close(); } catch (e) { }
+        s.node = null; s.workletUrl = null; s.pending = null; s.opusDec = null; s.opusTs = 0;
+        s.ctx = null; s.gain = null; s.codecName = '';
     };
 
     return obj;

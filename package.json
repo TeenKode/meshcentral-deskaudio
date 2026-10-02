@@ -1,6 +1,6 @@
 {
   "name": "meshcentral-deskaudio",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Desktop Audio plugin for MeshCentral — listen to a remote computer's desktop audio in the browser.",
   "private": true,
   "scripts": {

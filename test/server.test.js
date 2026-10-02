@@ -515,3 +515,52 @@ test("opus chunks are relayed with their codec field", () => {
     assert.strictEqual(chunk.codec, "opus");
     assert.strictEqual(chunk.d, "AAECAw==");
 });
+
+// ---------- codec negotiation ----------
+
+test("an explicit PCM choice starts the agent uncompressed", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    // Even a browser that still sends the legacy compress=true flag.
+    userStart(obj, makeUserSession(), makeWeb(), { codecs: ["pcm"], compress: true });
+    const st = agentStarts(agent)[0];
+    assert.strictEqual(st.compress, false);
+    assert.strictEqual(st.codec, null);
+});
+
+test("opus is negotiated when the browser can decode it", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    userStart(obj, makeUserSession(), makeWeb(), { codecs: ["opus", "adpcm", "pcm"], bitrate: 48 });
+    const st = agentStarts(agent)[0];
+    assert.strictEqual(st.codec, "opus");
+    assert.strictEqual(st.bitrate, 48);
+});
+
+test("a listener that cannot decode Opus is not attached to an Opus stream", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = makeWeb();
+    const a = makeUserSession({ userid: "user//a" });
+    const b = makeUserSession({ userid: "user//b" });
+    userStart(obj, a, web, { codecs: ["opus", "adpcm", "pcm"] });
+    const sid = agentStarts(agent)[0].sid;
+    agentMsg(obj, agent, { pluginaction: "status", sid, state: "started", proto: 2, rate: 16000, codec: "opus" });
+    userStart(obj, b, web, { codecs: ["adpcm", "pcm"] });
+    assert.strictEqual(lastStatus(b.ws).code, "codec_mismatch");
+    agentMsg(obj, agent, { pluginaction: "chunk", sid, rate: 16000, codec: "opus2", d: "QUJD" });
+    assert.ok(!b.ws.sent.some((m) => m.method === "onChunk"), "no undecodable audio for the second browser");
+    assert.strictEqual(a.ws.sent.filter((m) => m.method === "onChunk").pop().codec, "opus2", "opus2 chunks are relayed");
+});
+
+test("an agent that fell back from Opus (Linux) lets ADPCM-only listeners join", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = makeWeb();
+    userStart(obj, makeUserSession({ userid: "user//a" }), web, { codecs: ["opus", "adpcm", "pcm"] });
+    const sid = agentStarts(agent)[0].sid;
+    agentMsg(obj, agent, { pluginaction: "status", sid, state: "started", proto: 2, rate: 16000, codec: "adpcm" });
+    const b = makeUserSession({ userid: "user//b" });
+    userStart(obj, b, web, { codecs: ["adpcm", "pcm"] });
+    assert.strictEqual(lastStatus(b.ws).state, "started");
+});

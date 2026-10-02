@@ -1,123 +1,120 @@
-// Tests for the pure ring-buffer logic that the browser AudioWorklet mirrors
-// (obj._ringNew / obj._ringPush). The worklet itself runs in a real audio
-// thread in the browser; here we pin the exact overflow/underflow/drift
-// semantics the worklet implements, so both sides stay in sync.
+// Tests for the playback core (obj._playerCore): the exact code the
+// AudioWorklet runs (it is injected into the worklet via toString). Covers the
+// jitter buffer, underrun handling, backlog skipping, clock-drift control and
+// rate conversion.
 "use strict";
 
 const { test } = require("node:test");
 const assert = require("node:assert");
 const { loadPlugin } = require("./helpers");
 
-function newRing(cap) {
-    const { obj } = loadPlugin();
-    return { obj, ring: obj._ringNew(cap) };
+const Player = loadPlugin().obj._playerCore();
+
+function tone(n, rate, freq, start) {
+    const f = new Float32Array(n);
+    for (let i = 0; i < n; i++) f[i] = 0.5 * Math.sin(2 * Math.PI * freq * (start + i) / rate);
+    return f;
 }
+function render(p, n) { const out = new Float32Array(n); p.render(out); return out; }
+function rms(f) { let s = 0; for (const v of f) s += v * v; return Math.sqrt(s / f.length); }
 
-test("a fresh ring is empty and reports its capacity", () => {
-    const { ring } = newRing(8);
-    assert.strictEqual(ring.used, 0);
-    assert.strictEqual(ring.cap, 8);
+test("nothing plays until the jitter buffer is full", () => {
+    const p = new Player(16000);
+    p.setJitter(0.1);                                  // 1600 samples
+    p.push(new Float32Array(1000).fill(0.3), 16000);
+    assert.strictEqual(rms(render(p, 128)), 0, "still buffering");
+    p.push(new Float32Array(1000).fill(0.3), 16000);
+    const out = render(p, 128);
+    assert.ok(Math.abs(out[0] - 0.3) < 1e-6 && Math.abs(out[127] - 0.3) < 1e-6, "plays once 0.1 s is queued");
 });
 
-test("push then pull returns the samples in order (FIFO)", () => {
-    const { obj, ring } = newRing(8);
-    obj._ringPush(ring, [1, 2, 3]);
-    assert.strictEqual(ring.used, 3);
-    // pull is a closure in the module; verify order through push+overflow
-    // behavior instead: after pushing 4..8, all 8 are held in order.
-    obj._ringPush(ring, [4, 5, 6, 7, 8]);
-    assert.strictEqual(ring.used, 8);
-    // Read back via the internal buffer positions: r must point at 1.
-    assert.strictEqual(ring.buf[ring.r], 1);
+test("samples come out in order at equal rates", () => {
+    const p = new Player(16000);
+    p.setJitter(0.01);
+    const f = new Float32Array(400); for (let i = 0; i < f.length; i++) f[i] = i / 1000;
+    p.push(f, 16000);
+    const out = render(p, 128);
+    // (drift control may already read up to 0.005% fast: allow a hair of interpolation)
+    for (let i = 0; i < 128; i++) assert.ok(Math.abs(out[i] - i / 1000) < 1e-5, "sample " + i);
 });
 
-test("overflow drops the OLDEST samples, never the newest", () => {
-    const { obj, ring } = newRing(4);
-    obj._ringPush(ring, [1, 2]);
-    obj._ringPush(ring, [3, 4]);
-    const dropped = obj._ringPush(ring, [5, 6]);        // 1 and 2 are evicted
-    assert.strictEqual(dropped, 2);
-    assert.strictEqual(ring.used, 4);
-    assert.strictEqual(ring.buf[ring.r], 3);            // oldest survivor
-    // newest sample must be the one just written
-    const lastPos = (ring.w + ring.cap - 1) % ring.cap;
-    assert.strictEqual(ring.buf[lastPos], 6);
+test("an underrun fades to silence instead of holding the last sample, then rebuffers", () => {
+    const p = new Player(16000);
+    p.setJitter(0.01);                                 // 160 samples
+    p.push(new Float32Array(200).fill(0.5), 16000);
+    const out = render(p, 512);                        // only ~200 available
+    assert.ok(Math.abs(out[100] - 0.5) < 1e-6);
+    assert.ok(Math.abs(out[511]) < 1e-3, "faded to ~0, not a held DC value: " + out[511]);
+    for (let i = 201; i < 512; i++) assert.ok(Math.abs(out[i]) <= Math.abs(out[i - 1]) + 1e-9, "monotonic fade");
+    assert.strictEqual(p.underruns, 1);
+    p.push(new Float32Array(100).fill(0.5), 16000);   // below the jitter target again
+    assert.ok(rms(render(p, 64)) < 1e-3, "waits for the buffer to refill");
 });
 
-test("a single push larger than the whole ring keeps only its tail", () => {
-    const { obj, ring } = newRing(4);
-    const dropped = obj._ringPush(ring, [1, 2, 3, 4, 5, 6]);
-    assert.strictEqual(dropped, 2);
-    assert.strictEqual(ring.used, 4);
-    assert.strictEqual(ring.buf[ring.r], 3);
-    const lastPos = (ring.w + ring.cap - 1) % ring.cap;
-    assert.strictEqual(ring.buf[lastPos], 6);
+test("a backlog beyond the cap is skipped back to the target latency", () => {
+    const p = new Player(16000);
+    p.setJitter(0.1);                                  // cap = (0.2 + 0.45) s = 10400 samples
+    for (let i = 0; i < 20; i++) p.push(new Float32Array(1600), 16000);   // 2 s arrive at once
+    assert.ok(p.skips >= 1);
+    assert.ok(Math.abs(p.fill() - 1600) <= 1600, "latency back near the target, fill=" + p.fill());
 });
 
-test("pushing nothing is a no-op", () => {
-    const { obj, ring } = newRing(4);
-    assert.strictEqual(obj._ringPush(ring, []), 0);
-    assert.strictEqual(ring.used, 0);
-});
-
-test("wrap-around keeps every sample (no clobbering)", () => {
-    const { obj, ring } = newRing(4);
-    // Go around the circle many times with pull-by-overflow discipline:
-    // simulate the worklet: producer pushes 2, consumer reads 2, repeatedly.
-    const seen = [];
-    for (let round = 0; round < 100; round++) {
-        obj._ringPush(ring, [round, round + 1000]);
-        // consume exactly what was pushed (mimics the audio thread)
-        seen.push(ring.buf[ring.r]); ring.r = (ring.r + 1) % ring.cap; ring.used--;
-        seen.push(ring.buf[ring.r]); ring.r = (ring.r + 1) % ring.cap; ring.used--;
-        assert.strictEqual(ring.used, 0, "ring drains between rounds");
+test("clock drift: a producer 0.3% fast is absorbed without skips or underruns", () => {
+    const rate = 48000, block = 128;
+    const p = new Player(rate);
+    p.setJitter(0.15);
+    let produced = 0, acc = 0;
+    const per = block * 1.003;                         // the agent's clock runs 0.3% fast
+    for (let b = 0; b < rate * 60 / block; b++) {      // one minute of audio
+        acc += per;
+        while (acc >= 960) { p.push(tone(960, rate, 440, produced), rate); produced += 960; acc -= 960; }
+        render(p, block);
     }
-    // values must come back exactly, in order
-    for (let i = 0; i < 200; i++) {
-        const expected = (i % 2 === 0) ? (i / 2) : (Math.floor(i / 2) + 1000);
-        assert.strictEqual(seen[i], expected, `sample ${i}: ${seen[i]} vs ${expected}`);
-    }
+    assert.strictEqual(p.skips, 0, "no backlog jumps");
+    assert.strictEqual(p.underruns, 0, "no gaps");
+    assert.ok(Math.abs(p.fill() / rate - 0.15) < 0.08, "latency held near the target: " + (p.fill() / rate).toFixed(3) + " s");
 });
 
-test("drift +1% (consumer slower than producer): bounded delay, no loss of newest", () => {
-    const { obj, ring } = newRing(1600);     // 100 ms @ 16 kHz
-    // Producer 101 samples per tick, consumer 100: the backlog grows by ~1
-    // per tick and must be capped by the capacity, dropping the oldest.
-    // The first ~capacity excess samples go into filling the ring, so total
-    // drops over T ticks = T - capacity (here 5000 - 1600 = 3400).
-    let droppedTotal = 0;
-    let v = 0;
-    const ticks = 5000;
-    for (let tick = 0; tick < ticks; tick++) {
-        const chunk = [];
-        for (let k = 0; k < 101; k++) chunk.push(v++);
-        droppedTotal += obj._ringPush(ring, chunk);
-        for (let k = 0; k < 100; k++) { /* consume */ ring.r = (ring.r + 1) % ring.cap; ring.used--; }
-        assert.ok(ring.used <= ring.cap, "never exceeds capacity");
+test("clock drift: a producer 0.3% slow is absorbed without underruns", () => {
+    const rate = 48000, block = 128;
+    const p = new Player(rate);
+    p.setJitter(0.15);
+    let produced = 0, acc = 0;
+    for (let b = 0; b < rate * 60 / block; b++) {
+        acc += block * 0.997;
+        while (acc >= 960) { p.push(tone(960, rate, 440, produced), rate); produced += 960; acc -= 960; }
+        render(p, block);
     }
-    // Invariant: every sample is either consumed or dropped, and the backlog
-    // is bounded — drops over T ticks = drift*T - final backlog.
-    const produced = ticks * 101, consumed = ticks * 100;
-    assert.strictEqual(produced - consumed - droppedTotal, ring.used,
-        "produced - consumed - dropped = backlog");
-    assert.ok(ring.used <= ring.cap, "backlog never exceeds capacity");
-    assert.ok(droppedTotal < ticks, "drops are bounded by the drift rate, not runaway");
+    assert.strictEqual(p.underruns, 0, "no gaps");
 });
 
-test("drift -1% (consumer faster than producer): runs dry, repeats last (worklet rule)", () => {
-    const { obj, ring } = newRing(1600);
-    // Consumer 101 per tick, producer 100: the ring must empty out.
-    let v = 0;
-    for (let tick = 0; tick < 100; tick++) {
-        const chunk = [];
-        for (let k = 0; k < 100; k++) chunk.push(v++);
-        obj._ringPush(ring, chunk);
-        let taken = 0;
-        for (let k = 0; k < 101; k++) {
-            if (ring.used > 0) { ring.r = (ring.r + 1) % ring.cap; ring.used--; taken++; }
-            // else: the worklet repeats `last` — nothing to verify in the ring itself
-        }
-        assert.strictEqual(taken, 100, "exactly the pushed samples are available");
-    }
-    assert.strictEqual(ring.used, 0, "drained: the consumer is starved, as designed");
+test("input at another rate is resampled to the context rate", () => {
+    const p = new Player(48000);                       // browser refused a 16 kHz context
+    p.setJitter(0.05);
+    let produced = 0;
+    for (let i = 0; i < 10; i++) { p.push(tone(1600, 16000, 1000, produced), 16000); produced += 1600; }
+    const out = render(p, 4800);                       // 0.1 s at 48 kHz
+    let zc = 0;
+    for (let i = 1; i < out.length; i++) if ((out[i - 1] < 0) !== (out[i] < 0)) zc++;
+    assert.ok(zc >= 190 && zc <= 210, "1 kHz stays 1 kHz (~200 zero crossings in 0.1 s), got " + zc);
+});
+
+test("a rate change restarts the buffer", () => {
+    const p = new Player(48000);
+    p.setJitter(0.01);
+    p.push(new Float32Array(1000).fill(0.1), 16000);
+    p.push(new Float32Array(100).fill(0.2), 48000);
+    assert.strictEqual(p.fill(), 100);
+});
+
+test("the player source is self-contained (it runs inside the AudioWorklet)", () => {
+    const { obj } = loadPlugin();
+    const vm = require("node:vm");
+    const Isolated = vm.runInNewContext("(" + obj._playerCore.toString() + ")()", { Float32Array, Math });
+    const p = new Isolated(48000);
+    p.setJitter(0.01);
+    p.push(new Float32Array(1000).fill(0.25), 48000);
+    const out = new Float32Array(16);
+    p.render(out);
+    assert.ok(Math.abs(out[0] - 0.25) < 1e-6);
 });
