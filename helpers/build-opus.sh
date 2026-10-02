@@ -19,11 +19,18 @@ OPUS_TARBALL_SHA256=9480e329e989f70d69886ded470c7f8cfe6c0667cc4196d4837ac9e668fb
 OPUS_URL="https://github.com/xiph/opus/archive/refs/tags/v${OPUS_VER}.tar.gz"
 
 # ---------- download + verify ----------
-TARBALL="$(mktemp)"
-SRC="$(mktemp -d)"
-trap 'rm -f "$TARBALL"; rm -rf "$SRC"' EXIT
+# The source is unpacked under a stable subpath (the BUILDROOT temp dir itself
+# is unavoidable, but see -ffile-prefix-map below): object files embed the
+# compile-time directory (assert messages, __FILE__), and random temp paths
+# would make libopus.a - and the final exe - differ between builds, breaking
+# the byte-reproducibility check in CI.
+BUILDROOT="$(mktemp -d)"
+trap 'rm -rf "$BUILDROOT"' EXIT
+TARBALL="$BUILDROOT/opus.tar.gz"
+SRC="$BUILDROOT/opus-src"
 curl -sL -o "$TARBALL" "$OPUS_URL"
 echo "$OPUS_TARBALL_SHA256  $TARBALL" | sha256sum -c - >/dev/null
+mkdir -p "$SRC"
 tar xzf "$TARBALL" -C "$SRC" --strip-components=1
 
 # ---------- build per arch ----------
@@ -55,7 +62,7 @@ build_one() {
         -DOPUS_X86_MAY_HAVE_SSE4_1=OFF \
         -DOPUS_X86_MAY_HAVE_AVX=OFF \
         -DOPUS_X86_MAY_HAVE_AVX2=OFF \
-        -DCMAKE_C_FLAGS="-Os -fno-exceptions -fno-asynchronous-unwind-tables" \
+        -DCMAKE_C_FLAGS="-Os -fno-exceptions -fno-asynchronous-unwind-tables -ffile-prefix-map=$BUILDROOT=." \
         > /dev/null
     cmake --build "$OUT" --target opus -j"$(nproc)" > /dev/null
     # The build tree has no staged headers; stage them ourselves where
