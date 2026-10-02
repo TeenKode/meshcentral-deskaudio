@@ -692,3 +692,51 @@ test("the end of listening is logged with its duration", () => {
         assert.strictEqual(meshServer.events.filter((e) => /конец/.test(e.msg)).length, 2, "never logged twice");
     } finally { Date.now = realNow; }
 });
+
+// ---------- live settings (reconfigure) ----------
+
+test("the sole listener can change the stream live: new capture, no new consent prompt", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = consentWeb(8);
+    const sess = makeUserSession();
+    userStart(obj, sess, web, { codecs: ["adpcm", "pcm"], rate: 16000 });
+    const sid1 = agentStarts(agent)[0].sid;
+    agentMsg(obj, agent, { pluginaction: "status", sid: sid1, state: "started", proto: 3, rate: 16000 });
+
+    obj.serveraction({ pluginaction: "reconfigure", nodeid: NODE, codecs: ["opus", "adpcm", "pcm"], rate: 24000, bitrate: 48 }, sess, web);
+    const st2 = agentStarts(agent)[1];
+    assert.ok(st2, "capture restarted on the agent");
+    assert.notStrictEqual(st2.sid, sid1);
+    assert.strictEqual(st2.codec, "opus");
+    assert.strictEqual(st2.rate, 24000);
+    assert.strictEqual(st2.bitrate, 48);
+    assert.strictEqual(st2.consent.prompt, false, "consent already given: not asked again");
+
+    agentMsg(obj, agent, { pluginaction: "chunk", sid: sid1, rate: 16000, d: "T0xE" });
+    agentMsg(obj, agent, { pluginaction: "status", sid: st2.sid, state: "started", proto: 3, rate: 24000, codec: "opus" });
+    agentMsg(obj, agent, { pluginaction: "chunk", sid: st2.sid, rate: 24000, codec: "opus2", d: "TkVX" });
+    assert.deepStrictEqual(sess.ws.sent.filter((m) => m.method === "onChunk").map((m) => m.d), ["TkVX"], "only the new capture is heard");
+    assert.strictEqual(meshServer.events.filter((e) => /конец/.test(e.msg)).length, 0, "still listening: no end logged");
+});
+
+test("a shared stream is not reconfigured by one of its listeners", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = makeWeb();
+    const a = makeUserSession({ userid: "user//a" });
+    userStart(obj, a, web);
+    userStart(obj, makeUserSession({ userid: "user//b" }), web);
+    obj.serveraction({ pluginaction: "reconfigure", nodeid: NODE, codecs: ["pcm"] }, a, web);
+    assert.strictEqual(agentStarts(agent).length, 1, "agent untouched");
+    assert.strictEqual(lastStatus(a.ws).code, "shared_stream");
+});
+
+test("reconfigure from a session that is not listening is ignored", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = makeWeb();
+    userStart(obj, makeUserSession({ userid: "user//a" }), web);
+    obj.serveraction({ pluginaction: "reconfigure", nodeid: NODE, codecs: ["pcm"] }, makeUserSession({ userid: "user//x" }), web);
+    assert.strictEqual(agentStarts(agent).length, 1);
+});

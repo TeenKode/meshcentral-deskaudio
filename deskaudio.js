@@ -14,7 +14,7 @@ module.exports.deskaudio = function (parent) {
     var obj = {};
     obj.parent = parent;
     obj.meshServer = parent.parent;
-    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setRate', 'setCodec', 'setBitrate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_playerCore', 'probeCodecs', '_ensureCtx', '_ensureOpusDecoder', '_pushDecoded', '_opusChunk', '_teardown', 'log', 'onLog', 'copyLog', 'clearLog', 'toggleLog', '_stats'];
+    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setRate', 'setCodec', 'setBitrate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_playerCore', 'probeCodecs', '_params', '_apply', '_ensureCtx', '_ensureOpusDecoder', '_pushDecoded', '_opusChunk', '_teardown', 'log', 'onLog', 'copyLog', 'clearLog', 'toggleLog', '_stats'];
 
     var fs = require('fs');
     var path = require('path');
@@ -294,6 +294,60 @@ module.exports.deskaudio = function (parent) {
         logEvent(sess, st.node, 'Прослушивание звука рабочего стола: конец, ' + dur + (why ? ' (' + why + ')' : ''));
     }
 
+    // Tell the agent to (re)start capturing for stream `st` with the browser's
+    // requested parameters. Used for a new stream and for a live change of
+    // settings (reconfigure); a new sid makes any message of the previous
+    // capture stale.
+    function startAgent(agent, st, command, consent, h) {
+        var rate = parseInt(command.rate, 10);
+        if ([8000, 16000, 24000].indexOf(rate) < 0) rate = 16000;
+        st.rate = rate;
+        st.ready = false;
+        // Codec negotiation: the browser lists what it can decode (opus via
+        // WebCodecs; adpcm/pcm always). The agent confirms what it actually
+        // started in its 'started' status, and every chunk carries its
+        // codec, so the browser always decodes what it receives.
+        var codecs = Array.isArray(command.codecs) ? command.codecs : null;
+        st.codec = (codecs && codecs.indexOf('opus') >= 0) ? 'opus' : null;
+        // An explicit ['pcm'] means uncompressed, whatever `compress` says.
+        var compress = command.compress !== false &&
+            !(codecs && codecs.indexOf('pcm') >= 0 && codecs.indexOf('adpcm') < 0 && codecs.indexOf('opus') < 0);
+        var bitrate = parseInt(command.bitrate, 10);
+        if ([24, 32, 48].indexOf(bitrate) < 0) bitrate = 32;
+        var startMsg = {
+            pluginaction: 'start', sid: st.sid, rate: rate,
+            compress: compress, silence: command.silence !== false,
+            codec: st.codec, bitrate: bitrate,
+            consent: consent, script: h.script, spawnAsUser: settings().spawnasuser === true,
+            helper: { x64: { sha: h.sha64, size: h.size64 }, x86: { sha: h.sha32, size: h.size32 } }
+        };
+        // An agent not yet known to fetch helpers on demand gets the bytes.
+        if (!(agentProto.get(agent) >= 3)) {
+            startMsg.exe64 = h.exe64; startMsg.ver64 = h.ver64;
+            startMsg.exe32 = h.exe32; startMsg.ver32 = h.ver32;
+        }
+        sendAgent(agent, startMsg);
+    }
+
+    // Live change of codec / rate / bitrate / silence by a listener. Only the
+    // sole listener of a stream may change it (it is shared); the capture is
+    // restarted on the agent with a new sid while the listener stays attached.
+    // Consent was already given for this user, so it is not asked again.
+    function reconfigure(nodeid, sess, command) {
+        var st = streams[nodeid];
+        if (!st || st.listeners.indexOf(sess) < 0) return;
+        if (st.listeners.length > 1 || Object.keys(st.pending).length > 0)
+            return sendStatus(sess, nodeid, 'info', 'shared_stream', 'Звук этого устройства слушают и другие — параметры общего потока не изменены');
+        var agent = agentOf(nodeid);
+        if (!agent) return;
+        var h;
+        try { h = loadHelpers(); } catch (e) { return; }
+        st.sid = nextSid++;
+        st.consent = false;
+        startAgent(agent, st, command, { prompt: false, notify: false }, h);
+        sendStatus(sess, nodeid, 'info', 'reconfigured', 'Параметры изменены');
+    }
+
     // ---------- user (browser) -> server ----------
     function userAction(command, sess, web) {
         var nodeid = command.nodeid;
@@ -304,6 +358,7 @@ module.exports.deskaudio = function (parent) {
         var gen = ss.gen[nodeid] = (ss.gen[nodeid] || 0) + 1;
 
         if (command.pluginaction === 'stop') { removeListener(nodeid, sess); return; }
+        if (command.pluginaction === 'reconfigure') { reconfigure(nodeid, sess, command); return; }
         if (command.pluginaction !== 'start') return;
 
         var domain = sess.domain || obj.meshServer.config.domains[sess.user.domain];
@@ -363,30 +418,7 @@ module.exports.deskaudio = function (parent) {
                 consent: consent.prompt || consent.notify, ready: false, rate: rate
             };
             attach(st, sess);
-            // Codec negotiation: the browser lists what it can decode (opus via
-            // WebCodecs; adpcm/pcm always). The agent confirms what it actually
-            // started in its 'started' status, and every chunk carries its
-            // codec, so the browser always decodes what it receives.
-            var codecs = Array.isArray(command.codecs) ? command.codecs : null;
-            st.codec = (codecs && codecs.indexOf('opus') >= 0) ? 'opus' : null;
-            // An explicit ['pcm'] means uncompressed, whatever `compress` says.
-            var compress = command.compress !== false &&
-                !(codecs && codecs.indexOf('pcm') >= 0 && codecs.indexOf('adpcm') < 0 && codecs.indexOf('opus') < 0);
-            var bitrate = parseInt(command.bitrate, 10);
-            if ([24, 32, 48].indexOf(bitrate) < 0) bitrate = 32;
-            var startMsg = {
-                pluginaction: 'start', sid: st.sid, rate: rate,
-                compress: compress, silence: command.silence !== false,
-                codec: st.codec, bitrate: bitrate,
-                consent: consent, script: h.script, spawnAsUser: settings().spawnasuser === true,
-                helper: { x64: { sha: h.sha64, size: h.size64 }, x86: { sha: h.sha32, size: h.size32 } }
-            };
-            // An agent not yet known to fetch helpers on demand gets the bytes.
-            if (!(agentProto.get(agent) >= 3)) {
-                startMsg.exe64 = h.exe64; startMsg.ver64 = h.ver64;
-                startMsg.exe32 = h.exe32; startMsg.ver32 = h.ver32;
-            }
-            sendAgent(agent, startMsg);
+            startAgent(agent, st, command, consent, h);
         });
     }
 
@@ -493,7 +525,7 @@ module.exports.deskaudio = function (parent) {
             '<div id="da_bar" style="height:100%;width:0;background:#4a9;"></div></div>' +
             '<div id="da_status" style="font-size:12px;opacity:.8;min-height:16px"></div>' +
             '<fieldset style="margin:10px 0 0;border:1px solid rgba(128,128,128,.3);border-radius:6px;padding:8px 10px">' +
-            '<legend style="opacity:.7;font-size:12px;padding:0 4px">Настройки (применятся при следующем запуске)</legend>' +
+            '<legend style="opacity:.7;font-size:12px;padding:0 4px">Настройки</legend>' +
             '<div style="margin:5px 0">Кодек: <select id="da_codec" onchange="' + H + '.setCodec(this.value)">' +
             '<option value="auto">Авто — Opus, если браузер умеет</option>' +
             '<option value="opus">Opus — лучшее качество (48 кГц)</option>' +
@@ -599,8 +631,6 @@ module.exports.deskaudio = function (parent) {
         var s = pluginHandler.deskaudio._s || {};
         var b = document.getElementById('da_btn');
         if (b) b.value = s.active ? 'Остановить' : 'Слушать';
-        var r = document.getElementById('da_rate');
-        if (r) r.disabled = !!s.active;
         var st = document.getElementById('da_status');
         if (st) st.textContent = s.statusText || '';
         var db = document.getElementById('da_deskbtn');
@@ -673,8 +703,7 @@ module.exports.deskaudio = function (parent) {
             var Pt = pluginHandler.deskaudio, st2 = Pt._s || {};
             if (st2.active && !st2.gotAudio) { Pt.stop(); st2.statusText = 'Нет ответа от агента'; Pt.render(); }
         }, 10000);
-        var msg = { action: 'plugin', plugin: 'deskaudio', pluginaction: 'start', nodeid: s.nodeid, rate: rate,
-                    compress: codec !== 'pcm', silence: g('silence', '1') !== '0', bitrate: parseInt(g('bitrate', '32'), 10) };
+        var msg = P._params('start');
         P.log('старт: ' + (currentNode.name || s.nodeid) + ', кодек «' + codec + '», ' + (rate / 1000) + ' кГц, буфер ' +
               Math.round(s.jitter * 1000) + ' мс, тишину ' + (msg.silence ? 'не передавать' : 'передавать') +
               (codec === 'opus' || codec === 'auto' ? ', Opus ' + msg.bitrate + ' кбит/с' : ''));
@@ -688,6 +717,35 @@ module.exports.deskaudio = function (parent) {
         if (codec === 'opus' || codec === 'adpcm' || codec === 'pcm') send([codec]);
         else P.probeCodecs(send);
         P.render();
+    };
+
+    // The stream parameters from the saved settings, as a request to the
+    // server ('start' or 'reconfigure'). codecs is filled in by the caller.
+    obj._params = function (action) {
+        var s = pluginHandler.deskaudio._s || {};
+        function g(k, d) { try { var v = localStorage.getItem('deskaudio_' + k); return (v === null) ? d : v; } catch (e) { return d; } }
+        var rate = parseInt(g('rate', '16000'), 10);
+        if ([8000, 16000, 24000].indexOf(rate) < 0) rate = 16000;
+        var codec = g('codec', 'auto');
+        return { action: 'plugin', plugin: 'deskaudio', pluginaction: action, nodeid: s.nodeid, rate: rate,
+                 compress: codec !== 'pcm', silence: g('silence', '1') !== '0', bitrate: parseInt(g('bitrate', '32'), 10) };
+    };
+
+    // A stream setting changed while listening: ask the server to restart the
+    // capture with it (only possible when nobody else listens to the stream).
+    obj._apply = function () {
+        var P = pluginHandler.deskaudio, s = P._s || {};
+        if (!s.active || !s.nodeid) return;
+        var codec = (function () { try { return localStorage.getItem('deskaudio_codec') || 'auto'; } catch (e) { return 'auto'; } })();
+        var webCodecs = (typeof AudioDecoder !== 'undefined' && typeof EncodedAudioChunk !== 'undefined');
+        if (codec === 'opus' && !webCodecs) { s.statusText = 'Браузер не поддерживает декодирование Opus — выберите ADPCM'; P.render(); return; }
+        var msg = P._params('reconfigure');
+        P.probeCodecs(function (list) {
+            msg.codecs = (codec === 'opus' || codec === 'adpcm' || codec === 'pcm') ? [codec] : list;
+            P.log('изменение настроек на лету: кодек «' + codec + '», ' + (msg.rate / 1000) + ' кГц, тишину ' +
+                  (msg.silence ? 'не передавать' : 'передавать') + ', Opus ' + msg.bitrate + ' кбит/с');
+            meshserver.send(msg);
+        });
     };
 
     obj.stop = function () {
@@ -714,16 +772,17 @@ module.exports.deskaudio = function (parent) {
     obj.setAuto = function (on) { try { localStorage.setItem('deskaudio_auto', on ? '1' : '0'); } catch (e) { } };
 
     // More remembered settings (all apply on the next start).
-    obj.setRate = function (v) { try { localStorage.setItem('deskaudio_rate', String(v)); } catch (e) { } };
+    obj.setRate = function (v) { try { localStorage.setItem('deskaudio_rate', String(v)); } catch (e) { } pluginHandler.deskaudio._apply(); };
     obj.setCodec = function (v) {
         try { localStorage.setItem('deskaudio_codec', String(v)); } catch (e) { }
         var bri = document.getElementById('da_br');
         if (bri) bri.style.display = (v === 'opus') ? '' : 'none';
         var rr = document.getElementById('da_rate_row');
         if (rr) rr.style.display = (v === 'opus') ? 'none' : '';   // opus is always 48 kHz
+        pluginHandler.deskaudio._apply();
     };
-    obj.setBitrate = function (v) { try { localStorage.setItem('deskaudio_bitrate', String(v)); } catch (e) { } };
-    obj.setSilence = function (on) { try { localStorage.setItem('deskaudio_silence', on ? '1' : '0'); } catch (e) { } };
+    obj.setBitrate = function (v) { try { localStorage.setItem('deskaudio_bitrate', String(v)); } catch (e) { } pluginHandler.deskaudio._apply(); };
+    obj.setSilence = function (on) { try { localStorage.setItem('deskaudio_silence', on ? '1' : '0'); } catch (e) { } pluginHandler.deskaudio._apply(); };
     obj.setBuffer = function (v) {
         try { localStorage.setItem('deskaudio_buffer', String(v)); } catch (e) { }
         var s = pluginHandler.deskaudio._s || {};
@@ -755,6 +814,9 @@ module.exports.deskaudio = function (parent) {
                 var Pt = pluginHandler.deskaudio, st2 = Pt._s || {};
                 if (st2.active && !st2.gotAudio) { Pt.stop(); st2.statusText = 'Нет ответа от агента'; Pt.render(); }
             }, wt);
+        }
+        else if (m.state === 'info') {
+            if (m.msg) s.statusText = m.msg;
         }
         else if (m.state === 'error' || m.state === 'stopped') {
             P._teardown(s);

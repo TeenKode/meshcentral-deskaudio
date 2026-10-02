@@ -231,3 +231,23 @@ test("an opus2 chunk carries several packets", () => {
         assert.deepStrictEqual(decoded, [{ ts: 0, n: 3 }, { ts: 20000, n: 5 }], "two packets, 20 ms apart");
     } finally { delete global.AudioDecoder; delete global.EncodedAudioChunk; }
 });
+
+test("changing the codec while listening asks the server to reconfigure", () => {
+    const { obj } = loadPlugin();
+    const store = { deskaudio_codec: "adpcm" };
+    withStartGlobals(store, {}, (sent) => {
+        global.pluginHandler = { deskaudio: obj };
+        global.localStorage = { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = v; } };
+        obj.render = () => {};
+        obj.start();
+        assert.strictEqual(sent.length, 1);
+        obj.setCodec("pcm");
+        assert.strictEqual(sent.length, 2);
+        assert.strictEqual(sent[1].pluginaction, "reconfigure");
+        assert.deepStrictEqual(sent[1].codecs, ["pcm"]);
+        assert.strictEqual(sent[1].compress, false);
+        obj.stop();
+        obj.setRate("8000");
+        assert.strictEqual(sent.filter((m) => m.pluginaction === "reconfigure").length, 1, "not while stopped");
+    });
+});
