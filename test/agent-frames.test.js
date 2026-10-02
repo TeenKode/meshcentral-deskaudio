@@ -57,7 +57,8 @@ test("framed stream: chunks relay with codec flag; silence frames skipped", () =
             pluginaction: "start", sid: 1, rate: 16000, compress: true, silence: true,
             exe64: data.toString("base64")
         }, 0, 0, parent);
-        assert.strictEqual(calls.length, 1, "helper launched");
+        assert.strictEqual(calls.length, 1,
+            "helper launched; statuses=" + JSON.stringify(sent.filter((m) => m.pluginaction === "status")));
         assert.deepStrictEqual(calls[0].args, ["deskaudio.exe", "16000", "adpcm", "silence"],
             "codec and silence are passed to the helper");
 
