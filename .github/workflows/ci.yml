@@ -64,6 +64,7 @@ jobs:
       - name: Native encoder matches the fixture
         run: |
           cc -O2 -Wall -o /tmp/adpcm-test helpers/adpcm-test.c -lm
+          DA_DUMP_SIGNAL=1 /tmp/adpcm-test | head -1
           /tmp/adpcm-test > /tmp/adpcm-actual.hex
           if ! diff -u test/fixtures/native-adpcm.hex /tmp/adpcm-actual.hex; then
             echo "::error::helpers/adpcm-enc.h output differs from the JS encoder fixture — the C port is no longer byte-exact"
