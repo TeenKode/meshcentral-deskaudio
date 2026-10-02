@@ -56,6 +56,20 @@ jobs:
             exit 1
           fi
 
+  # Smoke test for the Opus encoder wrapper against the system libopus:
+  # catches frame-size regressions (invalid opus_encode() sizes fail silently
+  # in the helper otherwise).
+  opus-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system libopus
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev
+      - name: Build and run
+        run: |
+          cc -O2 -Wall -o /tmp/opus-test helpers/opus-test.c -lopus -lm
+          /tmp/opus-test
+
   shellcheck:
     runs-on: ubuntu-latest
     steps:

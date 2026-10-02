@@ -103,8 +103,14 @@ int main(int argc, char** argv) {
 
 #ifdef DA_BUILD_OPUS
     if (useOpus) {
-        op = da_opus_init(dstRate, opusBitrate);
-        if (!op) return fail("opus init failed (unsupported rate?)", 0);
+        // Opus is 48 kHz native: opus_encode() frame sizes are in ENCODER-rate
+        // samples, so feeding 16 kHz samples with frame_size=320 (6.67 ms at
+        // 48 kHz) is invalid and libopus errors out. Resample the capture to
+        // 48 kHz right here (the same SpeexDSP filter the ADPCM path uses)
+        // and give the encoder honest 960-sample 20 ms frames.
+        dstRate = 48000;
+        op = da_opus_init(48000, opusBitrate);
+        if (!op) return fail("opus init failed", 0);
     }
 #endif
 
