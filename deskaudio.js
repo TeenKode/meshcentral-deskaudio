@@ -419,21 +419,18 @@ module.exports.deskaudio = function (parent) {
             '<div id="da_bar" style="height:100%;width:0;background:#4a9;"></div></div>' +
             '<div id="da_status" style="font-size:12px;opacity:.8;min-height:16px"></div>' +
             '<fieldset style="margin:10px 0 0;border:1px solid rgba(128,128,128,.3);border-radius:6px;padding:8px 10px">' +
-            '<legend style="opacity:.7;font-size:12px;padding:0 4px">Настройки</legend>' +
-            '<div style="margin:5px 0">Качество: <select id="da_rate" onchange="' + H + '.setRate(this.value)">' +
-            '<option value="8000">8 кГц — экономно</option>' +
-            '<option value="16000">16 кГц — речь</option>' +
-            '<option value="24000">24 кГц — лучше</option></select>' +
-            ' <span style="opacity:.6;font-size:11px">применится при следующем запуске</span></div>' +
+            '<legend style="opacity:.7;font-size:12px;padding:0 4px">Настройки (применятся при следующем запуске)</legend>' +
             '<div style="margin:5px 0">Кодек: <select id="da_codec" onchange="' + H + '.setCodec(this.value)">' +
-            '<option value="auto">Авто (Opus, если браузер умеет)</option>' +
-            '<option value="opus">Opus — лучшее качество</option>' +
+            '<option value="auto">Авто — Opus, если браузер умеет</option>' +
+            '<option value="opus">Opus — лучшее качество (48 кГц)</option>' +
             '<option value="adpcm">ADPCM — совместимость</option>' +
             '<option value="pcm">PCM без сжатия</option></select>' +
             ' <span id="da_br" style="opacity:.6;font-size:11px">битрейт: <select id="da_bitrate" onchange="' + H + '.setBitrate(this.value)">' +
-            '<option value="24">24 кбит/с</option><option value="32">32</option><option value="48">48</option></select></span></div>' +
-            '<div style="margin:5px 0"><label><input type="checkbox" id="da_compress" onchange="' + H + '.setCompress(this.checked)"> ' +
-            'Сжатие звука (ADPCM, экономит трафик; выключите для максимального качества)</label></div>' +
+            '<option value="24">24 кбит/с</option><option value="32">32 кбит/с</option><option value="48">48 кбит/с</option></select></span></div>' +
+            '<div id="da_rate_row" style="margin:5px 0">Частота (для ADPCM/PCM): <select id="da_rate" onchange="' + H + '.setRate(this.value)">' +
+            '<option value="8000">8 кГц — экономно</option>' +
+            '<option value="16000">16 кГц — речь</option>' +
+            '<option value="24000">24 кГц — лучше</option></select></div>' +
             '<div style="margin:5px 0"><label><input type="checkbox" id="da_silence" onchange="' + H + '.setSilence(this.checked)"> ' +
             'Не передавать тишину (экономит трафик, когда ничего не играет)</label></div>' +
             '<div style="margin:5px 0">Буфер / задержка: <select id="da_buffer" onchange="' + H + '.setBuffer(this.value)">' +
@@ -448,10 +445,12 @@ module.exports.deskaudio = function (parent) {
         setSel('da_rate', pref('rate', '16000'));
         setSel('da_codec', pref('codec', 'auto'));
         setSel('da_bitrate', pref('bitrate', '32'));
+        var prefC = pref('codec', 'auto');
         var bri = document.getElementById('da_br');
-        if (bri) bri.style.display = (pref('codec', 'auto') === 'opus') ? '' : 'none';
+        if (bri) bri.style.display = (prefC === 'opus') ? '' : 'none';
+        var rr = document.getElementById('da_rate_row');
+        if (rr) rr.style.display = (prefC === 'opus') ? 'none' : '';
         setSel('da_buffer', pref('buffer', 'med'));
-        setChk('da_compress', pref('compress', '1') !== '0');
         setChk('da_silence', pref('silence', '1') !== '0');
         setChk('da_auto', pref('auto', '0') === '1');
         try { var vv = document.getElementById('da_vol'); var sv = pref('vol', null); if (sv !== null && vv) vv.value = sv; } catch (e) { }
@@ -573,7 +572,7 @@ module.exports.deskaudio = function (parent) {
         function g(k, d) { try { var v = localStorage.getItem('deskaudio_' + k); return (v === null) ? d : v; } catch (e) { return d; } }
         var r = document.getElementById('da_rate');
         var rate = r ? parseInt(r.value, 10) : parseInt(g('rate', '16000'), 10);
-        var compress = (g('compress', '1') !== '0');
+        var compress = (g('compress', null) !== '0');   // legacy key; codec='pcm' forces raw anyway
         var silence = (g('silence', '1') !== '0');
         var jit = { low: 0.08, med: 0.15, high: 0.30 }[g('buffer', 'med')] || 0.15;
         s.jitter = jit;
@@ -621,6 +620,8 @@ module.exports.deskaudio = function (parent) {
         try { localStorage.setItem('deskaudio_codec', String(v)); } catch (e) { }
         var bri = document.getElementById('da_br');
         if (bri) bri.style.display = (v === 'opus') ? '' : 'none';
+        var rr = document.getElementById('da_rate_row');
+        if (rr) rr.style.display = (v === 'opus') ? 'none' : '';   // opus is always 48 kHz
     };
     obj.setBitrate = function (v) { try { localStorage.setItem('deskaudio_bitrate', String(v)); } catch (e) { } };
     obj.setSilence = function (on) { try { localStorage.setItem('deskaudio_silence', on ? '1' : '0'); } catch (e) { } };
@@ -890,16 +891,27 @@ module.exports.deskaudio = function (parent) {
     // One opus chunk from the agent: [dur:2][packet] -> AudioDecoder.
     obj._opusChunk = function (s, bin) {
         var dec = pluginHandler.deskaudio._ensureOpusDecoder(s);
-        if (!dec) return;                       // unsupported: no audio, but no crash
+        if (!dec) {
+            // Opus was negotiated but this browser cannot decode it (no
+            // WebCodecs): say so instead of hanging on "Подключение…".
+            s.active = false;
+            s.statusText = 'Браузер не поддерживает декодирование Opus — выберите ADPCM в настройках';
+            pluginHandler.deskaudio.render();
+            return;
+        }
         if (bin.length < 2) return;
         var dur = bin.charCodeAt(0) | (bin.charCodeAt(1) << 8);
         var pkt = bin.substring(2);
         if (dur <= 0 || pkt.length === 0) return;
         var u8 = new Uint8Array(pkt.length);
         for (var i = 0; i < pkt.length; i++) u8[i] = pkt.charCodeAt(i) & 0xFF;
+        // Opus packets are not AudioData (that is a PCM container): they go
+        // in as EncodedAudioChunk. timestamp must be monotonically increasing
+        // (in microseconds), or decoders drop or reorder the chunks.
+        if (s.opusTs === undefined) s.opusTs = 0;
         try {
-            dec.decode(new AudioData({ format: 'opus', sampleRate: 48000, numberOfFrames: dur,
-                                       numberOfChannels: 1, timestamp: 0, data: u8 }));
+            dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: s.opusTs, duration: dur * 1000000 / 48000, data: u8 }));
+            s.opusTs += dur * 1000000 / 48000;
         } catch (e) { }
     }
 
@@ -908,6 +920,7 @@ module.exports.deskaudio = function (parent) {
         var s = (pluginHandler.deskaudio._s || {});
         if (!s.active || !m || m.nodeid !== s.nodeid || typeof m.d !== 'string') return;
         var rate = m.rate || 16000;
+        if (m.codec === 'opus') rate = 48000;    // opus packets are 48 kHz native
         pluginHandler.deskaudio._ensureCtx(s, rate);
         if (!s.ctx) return;
         var bin = atob(m.d);

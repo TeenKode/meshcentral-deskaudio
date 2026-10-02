@@ -58,10 +58,10 @@ test("an opus chunk is parsed, decoded, and pushed into the worklet", () => {
             closed: false,
             state: "unconfigured",
             configure(cfg) { dec.cfg = cfg; dec.state = "configured"; },
-            decode(ad) {
-                decoded.push({ ts: ad.timestamp, frames: ad.numberOfFrames, data: Array.from(ad.data) });
-                // simulate the decoder producing output
-                const plane = new Float32Array(ad.numberOfFrames);
+            decode(chunk) {
+                decoded.push({ ts: chunk.timestamp, bytes: Array.from(new Uint8Array(chunk.data instanceof ArrayBuffer ? new Uint8Array(chunk.data) : chunk.data)) });
+                // simulate the decoder producing output: 960-sample f32 plane
+                const plane = new Float32Array(960);
                 for (let i = 0; i < plane.length; i++) plane[i] = (i % 7) / 7 - 0.5;
                 handlers.output({ allocationSize: () => plane.length,   // samples, per WebCodecs spec
                                   copyTo: (dst) => { dst.set(plane); },
@@ -72,13 +72,11 @@ test("an opus chunk is parsed, decoded, and pushed into the worklet", () => {
         };
         return dec;
     };
-    global.AudioData = function (init) {
-        this.format = init.format;
-        this.sampleRate = init.sampleRate;
-        this.numberOfFrames = init.numberOfFrames;
-        this.numberOfChannels = init.numberOfChannels;
+    global.EncodedAudioChunk = function (init) {
+        this.type = init.type;
         this.timestamp = init.timestamp;
-        this.data = init.data;
+        this.duration = init.duration;
+        this.data = init.data.buffer ? init.data.buffer : init.data;
     };
 
     const node = { port: { messages: [], onmessage: null, postMessage(m, tr) { this.messages.push(m); } }, connect() {} };
@@ -91,8 +89,8 @@ test("an opus chunk is parsed, decoded, and pushed into the worklet", () => {
             obj.onChunk({ nodeid: "node//pc1", rate: 16000, codec: "opus", d: payload.toString("base64") });
         });
         assert.strictEqual(decoded.length, 1, "one packet was decoded");
-        assert.strictEqual(decoded[0].frames, 960, "duration parsed from the frame header");
-        assert.deepStrictEqual(decoded[0].data, [1, 2, 3], "opus packet bytes forwarded");
+        assert.deepStrictEqual(decoded[0].bytes, [1, 2, 3], "opus packet bytes forwarded");
+        assert.strictEqual(decoded[0].ts, 0, "first chunk timestamps at 0");
         assert.strictEqual(node.port.messages.length, 1, "decoded PCM pushed to the ring");
         assert.strictEqual(node.port.messages[0].s.length, 960);
     } finally {

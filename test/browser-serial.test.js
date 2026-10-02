@@ -156,3 +156,35 @@ test("no exported function references a bare module-level helper", () => {
         }
     }
 });
+
+test("the settings panel renders and toggles in the serialized VM", () => {
+    const { obj } = loadPlugin();
+    const els = {};
+    const el = (id) => (els[id] = els[id] || { id, value: "", checked: false, style: {}, appendChild() { }, addEventListener() { }, className: "", title: "" });
+    const ctxObj = {};
+    const sandbox = {
+        pluginHandler: { deskaudio: ctxObj, registerPluginTab() { } },
+        console,
+        setTimeout: () => 0, clearTimeout: () => { },
+        localStorage: { getItem: () => null, setItem() { } },
+        atob: (b64) => Buffer.from(b64, "base64").toString("binary"),
+        document: { getElementById: el, createElement: () => el("x") },
+        QH: () => { },
+        currentNode: { _id: "node//pc1" },
+    };
+    const ctx = vm.createContext(sandbox);
+    for (const name of obj.exports) {
+        vm.runInContext(`pluginHandler.deskaudio.${name} = ${obj[name].toString()};`, ctx);
+    }
+    ctxObj.onDeviceRefreshEnd();
+    assert.ok(els["da_codec"], "codec select rendered");
+    assert.ok(els["da_bitrate"], "bitrate select rendered");
+    assert.strictEqual(els["da_compress"], undefined, "the redundant compress checkbox is gone");
+
+    ctxObj.setCodec("opus");
+    assert.strictEqual(els["da_rate_row"].style.display, "none", "rate row hidden for opus");
+    assert.strictEqual(els["da_br"].style.display, "", "bitrate visible for opus");
+    ctxObj.setCodec("adpcm");
+    assert.strictEqual(els["da_rate_row"].style.display, "", "rate row visible for adpcm");
+    assert.strictEqual(els["da_br"].style.display, "none", "bitrate hidden for adpcm");
+});
