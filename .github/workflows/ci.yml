@@ -8,8 +8,15 @@ permissions:
   contents: read
 
 jobs:
+  # The agent tests are split by platform: the Linux suite exercises the
+  # sh -c capture path, the Windows suite the helper-drop and framed-stdout
+  # path. Each runs on its own runner; each suite skips itself elsewhere.
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
