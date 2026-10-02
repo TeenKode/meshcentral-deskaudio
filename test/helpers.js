@@ -76,6 +76,9 @@ function loadPlugin() {
     const mod = require(PLUGIN_SERVER);
     const meshServer = makeMeshServer();
     const obj = mod.deskaudio({ parent: meshServer });
+    // The browser UI follows the page/browser language; tests pin Russian
+    // (Node 22 has a navigator.language, Node 20 does not).
+    obj._langCache = "ru";
     return { obj, meshServer };
 }
 
