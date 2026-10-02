@@ -34,6 +34,16 @@ jobs:
             echo "::error::helpers/*.exe differ from win-loopback-native.cpp — run helpers/build-native.sh on Ubuntu 24.04 and commit the result"
             exit 1
           fi
+      # Uploaded so the binaries can be fetched and committed when the source
+      # legitimately changes (this runner has the exact pinned toolchain).
+      - name: Upload rebuilt helpers
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebuilt-helpers
+          path: |
+            helpers/deskaudio-x64.exe
+            helpers/deskaudio-x86.exe
+          if-no-files-found: error
 
   shellcheck:
     runs-on: ubuntu-latest
@@ -50,5 +60,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build and run the resampler test
         run: |
-          cc -O2 -Wall -o /tmp/resample-test helpers/resample-test.c
+          cc -O2 -Wall -o /tmp/resample-test helpers/resample-test.c -lm
           /tmp/resample-test

@@ -21,7 +21,8 @@
 #include <math.h>
 #include <string.h>
 
-#include "speexdsp/speex_resampler.h"
+/* The resampler implementation, exactly as the Windows helper builds it. */
+#include "speexdsp/resample.c"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
