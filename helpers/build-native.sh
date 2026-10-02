@@ -13,6 +13,8 @@
 #
 # The build is reproducible (--no-insert-timestamp): CI rebuilds the helpers on
 # Ubuntu 24.04 and fails if the committed .exe files differ from the source.
+set -e
+cd "$(dirname "$0")"
 
 # Compiler flags. Kept in a variable (not the script's positional parameters:
 # build_one() has its own "$@") and expanded with a deliberate unquoted word
