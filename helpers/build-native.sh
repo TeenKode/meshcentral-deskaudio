@@ -17,6 +17,8 @@ cd "$(dirname "$0")"
 # splitting without tripping shellcheck SC2086.
 set -- -O2 -static -static-libgcc -static-libstdc++ -s -Wall -Wl,--no-insert-timestamp
 
+# resample.c (SpeexDSP) is included directly by win-loopback-native.cpp, so the
+# only compile unit is the .cpp itself.
 x86_64-w64-mingw32-g++ -o deskaudio-x64.exe win-loopback-native.cpp "$@" -lole32
 i686-w64-mingw32-g++   -o deskaudio-x86.exe win-loopback-native.cpp "$@" -lole32
 

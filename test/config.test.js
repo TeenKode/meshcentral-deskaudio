@@ -40,7 +40,11 @@ test("the files the plugin loads at runtime exist", () => {
         "helpers/win-loopback-native.cpp",
         "helpers/deskaudio-x64.exe",
         "helpers/deskaudio-x86.exe",
-        "helpers/linux-capture.sh"
+        "helpers/linux-capture.sh",
+        "helpers/speexdsp/resample.c",
+        "helpers/speexdsp/speex_resampler.h",
+        "helpers/speexdsp/arch.h",
+        "helpers/resample-test.c"
     ]) {
         assert.ok(fs.existsSync(path.join(DIR, rel)), "missing: " + rel);
     }

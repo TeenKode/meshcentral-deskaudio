@@ -40,3 +40,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: shellcheck helpers/*.sh
+
+  # The resampler quality gate: build the host test with g++ and run it. Checks
+  # passband fidelity and anti-alias suppression for 48k and 44.1k -> 16k,
+  # and that streaming in odd-sized pieces matches one-shot resampling.
+  resampler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the resampler test
+        run: |
+          g++ -O2 -Wall -o /tmp/resample-test helpers/resample-test.c
+          /tmp/resample-test
