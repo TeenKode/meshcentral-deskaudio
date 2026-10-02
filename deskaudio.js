@@ -14,7 +14,7 @@ module.exports.deskaudio = function (parent) {
     var obj = {};
     obj.parent = parent;
     obj.meshServer = parent.parent;
-    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setCompress', 'setRate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode'];
+    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setCompress', 'setRate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_ringNew', '_ringPush'];
 
     var fs = require('fs');
     var path = require('path');
@@ -504,13 +504,16 @@ module.exports.deskaudio = function (parent) {
         if (s.active || typeof currentNode === 'undefined' || !currentNode) return;
         var AC = window.AudioContext || window.webkitAudioContext;
         if (!AC) { s.statusText = 'Браузер не поддерживает Web Audio'; P.render(); return; }
-        s.ctx = new AC();
-        if (s.ctx.resume) s.ctx.resume();          // we are inside a click handler, so this is allowed
-        s.gain = s.ctx.createGain();
+        // The AudioContext is created lazily in _ensureCtx() on the first
+        // chunk, once the agent's actual sample rate is known: new AC({sampleRate})
+        // then makes the browser run at the agent's rate, so chunks are never
+        // resampled individually (the per-chunk resampling is what clicked at
+        // chunk boundaries).
         var v = document.getElementById('da_vol');
-        s.gain.gain.value = v ? (v.value / 100) : 0.8;
-        s.gain.connect(s.ctx.destination);
+        s.vol = v ? (v.value / 100) : 0.8;
         s.next = 0;
+        s.pending = [];
+        s.workletReady = false;
         s.nodeid = currentNode._id;
         s.active = true;
         s.gotAudio = false;
@@ -537,13 +540,17 @@ module.exports.deskaudio = function (parent) {
         var s = P._s = P._s || {};
         if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }
         if (s.nodeid) meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'stop', nodeid: s.nodeid });
+        try { if (s.node) { s.node.disconnect(); s.node.port.onmessage = null; } } catch (e) { }
+        try { if (s.workletUrl) URL.revokeObjectURL(s.workletUrl); } catch (e) { }
         try { if (s.ctx) s.ctx.close(); } catch (e) { }
+        s.node = null; s.workletUrl = null; s.pending = null; s.workletReady = false;
         s.ctx = null; s.gain = null; s.active = false; s.statusText = 'Остановлено';
         P.render();
     };
 
     obj.setVolume = function (val) {
         var s = pluginHandler.deskaudio._s || {};
+        s.vol = val / 100;
         if (s.gain) s.gain.gain.value = val / 100;
         try { localStorage.setItem('deskaudio_vol', String(val)); } catch (e) { }
     };
@@ -591,6 +598,77 @@ module.exports.deskaudio = function (parent) {
         P.render();
     };
 
+    // ---- AudioWorklet (click-free playback + drift handling) ----
+    // The worklet pulls from a ring buffer shared via messages: chunks are
+    // posted into it, the audio thread drains 128-sample frames. This keeps
+    // chunk boundaries seamless (no per-chunk BufferSource scheduling) and
+    // absorbs clock drift between the agent and the browser.
+    var WORKLET_SRC =
+        "class DeskAudioProcessor extends AudioWorkletProcessor {" +
+        "  constructor() {" +
+        "    super();" +
+        "    this.ring = new Float32Array(RCAP);" +
+        "    this.r = 0; this.w = 0; this.used = 0; this.last = 0; this.fill = 0;" +
+        "    this.port.onmessage = (e) => {" +
+        "      const d = e.data;" +
+        "      if (d.cmd === 'push') { const s = d.s;" +
+        "        for (let i = 0; i < s.length; i++) {" +
+        "          if (this.used === RCAP) { this.r = (this.r + 1) % RCAP; this.used--; }" +
+        "          this.ring[this.w] = s[i]; this.w = (this.w + 1) % RCAP; this.used++;" +
+        "        }" +
+        "        this.fill = this.used / RCAP;" +
+        "        this.port.postMessage({ fill: this.fill });" +
+        "      }" +
+        "    };" +
+        "  }" +
+        "  process(inputs, outputs) {" +
+        "    const out = outputs[0][0];" +
+        "    for (let i = 0; i < out.length; i++) {" +
+        "      if (this.used > 0) {" +
+        "        out[i] = this.ring[this.r]; this.last = out[i];" +
+        "        this.r = (this.r + 1) % RCAP; this.used--;" +
+        "      } else { out[i] = this.last; }" +
+        "    }" +
+        "    this.fill = this.used / RCAP;" +
+        "    return true;" +
+        "  }" +
+        "}" +
+        "registerProcessor('deskaudio-processor', DeskAudioProcessor);";
+
+    // ---- Ring buffer (pure functions; the worklet mirrors this logic) ----
+    // One producer (network chunks) and one consumer (the audio thread) at a
+    // fixed sample rate. `buf` is a Float32Array used as a circular queue.
+    // Drift: when the consumer runs dry it repeats the last sample (keeps the
+    // stream continuous when the agent is marginally slower); overflow drops
+    // the oldest samples (never the newest).
+    obj._ringNew = function (capacitySamples) {
+        return { buf: new Float32Array(capacitySamples), cap: capacitySamples, r: 0, w: 0, used: 0, last: 0 };
+    };
+
+    // Push floats onto the ring. If they do not fit, the OLDEST samples are
+    // overwritten. Returns the number of samples dropped.
+    obj._ringPush = function (ring, samples) {
+        var dropped = 0;
+        for (var i = 0; i < samples.length; i++) {
+            if (ring.used === ring.cap) {           // full: drop the oldest
+                ring.r = (ring.r + 1) % ring.cap; ring.used--;
+                dropped++;
+            }
+            ring.buf[ring.w] = samples[i];
+            ring.w = (ring.w + 1) % ring.cap; ring.used++;
+        }
+        return dropped;
+    };
+
+    // Pull up to `n` samples; returns a Float32Array (possibly shorter).
+    function ringPull(ring, n) {
+        var take = Math.min(n, ring.used);
+        var out = new Float32Array(take);
+        for (var i = 0; i < take; i++) { out[i] = ring.buf[ring.r]; ring.r = (ring.r + 1) % ring.cap; }
+        ring.used -= take;
+        return out;
+    }
+
     // IMA ADPCM decoder — mirrors modules_meshcore/deskaudio.js adpcmEncode().
     obj._adpcmDecode = function (bin) {
         var STEP = [
@@ -629,10 +707,71 @@ module.exports.deskaudio = function (parent) {
         return out;
     };
 
+    // Create the AudioContext at the agent's actual rate on the first chunk,
+    // then wire up the worklet (or the fallback scheduler). The rate is known
+    // only here, not in start().
+    function _ensureCtx(s, rate) {
+        if (s.ctx) return;
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        // 7a: ask for the agent's rate. If the browser refuses (or silently
+        // clamps to its hardware rate), fall back to the default context —
+        // the browser then resamples each createBuffer() internally, which is
+        // the old behavior, still click-free at chunk boundaries because the
+        // fallback scheduler is sample-continuous.
+        try {
+            s.ctx = new AC({ sampleRate: rate });
+            if (s.ctx.sampleRate && Math.abs(s.ctx.sampleRate - rate) > 1) {
+                try { s.ctx.close(); } catch (e) { }
+                s.ctx = null;
+            }
+        } catch (e) { s.ctx = null; }
+        if (!s.ctx) { try { s.ctx = new AC(); } catch (e) { return; } }
+        if (s.ctx.resume) s.ctx.resume();       // allowed: a user gesture started this
+        s.gain = s.ctx.createGain();
+        s.gain.gain.value = (s.vol !== undefined) ? s.vol : 0.8;
+        s.gain.connect(s.ctx.destination);
+
+        // 7b: AudioWorklet + ring buffer — seamless chunk boundaries and
+        // clock-drift absorption. Blob URL because the plugin cannot serve
+        // its own files.
+        var cap = Math.max(128, Math.round((s.jitter || 0.15) * rate * 4));   // ~4x the jitter buffer
+        var code = WORKLET_SRC.replace(/RCAP/g, String(cap));
+        if (!s.pending) s.pending = [];
+        if (s.ctx.audioWorklet && typeof Blob !== 'undefined' && typeof URL !== 'undefined' && URL.createObjectURL) {
+            try {
+                var url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+                s.workletUrl = url;
+                s.ctx.audioWorklet.addModule(url).then(function () {
+                    if (!s.ctx) return;
+                    s.node = new AudioWorkletNode(s.ctx, 'deskaudio-processor');
+                    s.node.port.onmessage = function (e) { if (s.node && e.data && e.data.fill !== undefined) s.fill = e.data.fill; };
+                    s.node.connect(s.gain);
+                    s.workletReady = true;
+                    // Audio decoded before the module finished loading: flush it.
+                    if (s.pending && s.pending.length) {
+                        for (var i = 0; i < s.pending.length; i++) {
+                            var cp = Float32Array.from(s.pending[i]);
+                            s.node.port.postMessage({ cmd: 'push', s: cp });
+                        }
+                    }
+                    s.pending = null;
+                }).catch(function () { s.workletReady = false; s.pending = null; });
+            } catch (e) { s.workletReady = false; s.pending = null; }
+        } else {
+            s.workletReady = false;
+            s.pending = null;
+        }
+        s.next = 0;
+    }
+
     obj.onChunk = function (a, b) {
         var m = (b !== undefined && b !== null) ? b : a;
         var s = (pluginHandler.deskaudio._s || {});
-        if (!s.active || !s.ctx || !m || m.nodeid !== s.nodeid || typeof m.d !== 'string') return;
+        if (!s.active || !m || m.nodeid !== s.nodeid || typeof m.d !== 'string') return;
+        var rate = m.rate || 16000;
+        _ensureCtx(s, rate);
+        if (!s.ctx) return;
         var bin = atob(m.d);
         var f, sum = 0, i;
         if (m.codec === 'adpcm') {
@@ -651,18 +790,34 @@ module.exports.deskaudio = function (parent) {
             }
         }
         var n = f.length;
-        var jit = s.jitter || 0.15;                          // jitter buffer from the Буфер setting
-        var ctx = s.ctx, now = ctx.currentTime;
-        if (s.next - now > jit * 2 + 0.45) return;           // too far behind real time: drop
-        var buf = ctx.createBuffer(1, n, m.rate || 16000);
-        buf.copyToChannel(f, 0);
-        var src = ctx.createBufferSource();
-        src.buffer = buf;
-        src.connect(s.gain);
-        if (s.next < now + 0.02) s.next = now + jit;         // (re)start with the chosen jitter buffer
-        src.start(s.next);
-        s.next += buf.duration;
-        if (!s.gotAudio) { s.gotAudio = true; if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; } s.statusText = 'Идёт передача звука (' + ((m.rate || 16000) / 1000) + ' кГц)'; pluginHandler.deskaudio.render(); }
+        if (!s.gotAudio) {
+            s.gotAudio = true;
+            if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }
+            s.statusText = 'Идёт передача звука (' + (rate / 1000) + ' кГц)';
+            pluginHandler.deskaudio.render();
+        }
+
+        if (s.workletReady && s.node) {
+            // Seamless path: push into the worklet's ring buffer.
+            var cp = Float32Array.from(f);   // copy: the posted buffer may be transferred
+            s.node.port.postMessage({ cmd: 'push', s: cp }, [cp.buffer]);
+        } else if (s.ctx.audioWorklet && s.pending !== null) {
+            // Module still loading: hold the decoded audio until it is ready.
+            s.pending.push(f);
+        } else {
+            // Fallback (old scheduler) when AudioWorklet is unavailable.
+            var jit = s.jitter || 0.15;
+            var ctx = s.ctx, now = ctx.currentTime;
+            if (s.next - now > jit * 2 + 0.45) return;   // too far behind real time: drop
+            var buf = ctx.createBuffer(1, n, rate);
+            buf.copyToChannel(f, 0);
+            var src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(s.gain);
+            if (s.next < now + 0.02) s.next = now + jit;
+            src.start(s.next);
+            s.next += buf.duration;
+        }
         var bar = document.getElementById('da_bar');
         if (bar) bar.style.width = Math.min(100, Math.round(Math.sqrt(sum / n) * 300)) + '%';
     };

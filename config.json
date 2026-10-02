@@ -1,7 +1,7 @@
 {
   "name": "Desktop Audio",
   "shortName": "deskaudio",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "author": "TeenKode",
   "description": "Listen to the remote computer's desktop audio (what plays through its speakers) in real time, in the browser.",
   "hasAdminPanel": false,
@@ -9,7 +9,10 @@
   "changelogUrl": "https://raw.githubusercontent.com/TeenKode/meshcentral-deskaudio/main/changelog.md",
   "configUrl": "https://raw.githubusercontent.com/TeenKode/meshcentral-deskaudio/main/config.json",
   "downloadUrl": "https://github.com/TeenKode/meshcentral-deskaudio/archive/refs/heads/main.zip",
-  "repository": { "type": "git", "url": "https://github.com/TeenKode/meshcentral-deskaudio.git" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TeenKode/meshcentral-deskaudio.git"
+  },
   "versionHistoryUrl": "https://api.github.com/repos/TeenKode/meshcentral-deskaudio/tags",
   "meshCentralCompat": ">=1.1.0"
 }
