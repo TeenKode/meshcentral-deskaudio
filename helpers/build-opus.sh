@@ -10,6 +10,10 @@
 #
 #   sudo apt-get install -y g++-mingw-w64-x86-64 g++-mingw-w64-i686 cmake
 #   ./build-opus.sh
+#
+# Offline / behind a proxy: point OPUS_SRC at a checkout of the v1.5.2 tag
+# (git clone --depth 1 --branch v1.5.2 https://github.com/xiph/opus) and the
+# download is skipped. The produced binaries are identical either way.
 set -e
 HELPERS="$(cd "$(dirname "$0")" && pwd)"
 cd "$HELPERS"
@@ -28,10 +32,15 @@ BUILDROOT="$(mktemp -d)"
 trap 'rm -rf "$BUILDROOT"' EXIT
 TARBALL="$BUILDROOT/opus.tar.gz"
 SRC="$BUILDROOT/opus-src"
-curl -sL -o "$TARBALL" "$OPUS_URL"
-echo "$OPUS_TARBALL_SHA256  $TARBALL" | sha256sum -c - >/dev/null
 mkdir -p "$SRC"
-tar xzf "$TARBALL" -C "$SRC" --strip-components=1
+if [ -n "$OPUS_SRC" ]; then
+    # Copy (not use in place): the build must see the same /opus-src path.
+    tar -C "$OPUS_SRC" --exclude=.git -cf - . | tar -C "$SRC" -xf -
+else
+    curl -sL -o "$TARBALL" "$OPUS_URL"
+    echo "$OPUS_TARBALL_SHA256  $TARBALL" | sha256sum -c - >/dev/null
+    tar xzf "$TARBALL" -C "$SRC" --strip-components=1
+fi
 
 # ---------- build per arch ----------
 build_one() {

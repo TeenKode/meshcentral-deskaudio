@@ -6,12 +6,12 @@
  * helper touches; DA_BUILD_OPUS gates the whole thing so the helper still
  * compiles (and works, ADPCM-only) when libopus is not linked in.
  *
- * Opus runs at 48 kHz natively, and opus_encode() accepts 8/12/16/24/48 kHz
- * input and resamples internally, so the capture rate feeds the encoder
- * directly. Frames are 20 ms; the encoded payload of one frame is
- * [dur:2 LE][opus packet] where dur = duration in 48 kHz samples (960): the
- * browser sizes its ring-buffer push from dur without depending on what
- * AudioDecoder reports.
+ * The encoder runs at 48 kHz and opus_encode() sizes frames in ENCODER-rate
+ * samples, so the helper resamples the capture to 48 kHz first and feeds
+ * 960-sample (20 ms) frames. (Feeding capture-rate samples with a
+ * capture-rate frame size is an invalid Opus frame duration: that was the
+ * "wrong speed" bug of 1.0.2.) Each packet is reported with its duration in
+ * 48 kHz samples, which the browser uses for the decoder timestamps.
  */
 #ifndef DA_OPUS_ENC_H
 #define DA_OPUS_ENC_H
@@ -35,7 +35,8 @@ typedef struct {
 } DaOpusEnc;
 
 /* bitrate: bits per second (24000/32000/48000 typical). Returns NULL on
- * failure. `inRate` is the capture rate: 8000/12000/16000/24000/48000. */
+ * failure. `inRate` is the rate of the samples fed in; the helper always
+ * passes 48000 (see above). */
 static DaOpusEnc* da_opus_init(int inRate, int bitrate) {
     if (inRate != 8000 && inRate != 12000 && inRate != 16000
         && inRate != 24000 && inRate != 48000) return NULL;
@@ -49,6 +50,13 @@ static DaOpusEnc* da_opus_init(int inRate, int bitrate) {
     e->pcm = (short*)malloc(e->frameSamples * sizeof(short));
     if (!e->pcm) { opus_encoder_destroy(e->enc); free(e); return NULL; }
     return e;
+}
+
+/* Drop the encoder history and any partial frame (after a silent pause). */
+static void da_opus_reset(DaOpusEnc* e) {
+    if (!e) return;
+    opus_encoder_ctl(e->enc, OPUS_RESET_STATE);
+    e->pendLen = 0;
 }
 
 static void da_opus_free(DaOpusEnc* e) {

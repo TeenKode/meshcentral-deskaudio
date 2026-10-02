@@ -43,7 +43,15 @@ int main(void) {
     }
     /* 2 s of 20 ms frames = ~100 packets (minus the tail still buffered). */
     if (emitted < 95 || emitted > 100) { fprintf(stderr, "unexpected packet count: %d\n", emitted); return 1; }
-    printf("opus smoke ok: %d packets\n", emitted);
+    /* After a reset (the helper resets after a suppressed silent pause) the
+       encoder must work again from a clean state: 40 ms in, 2 packets out. */
+    da_opus_feed(e, in, 977, emit);           /* leave a partial frame behind */
+    da_opus_reset(e);
+    int before = emitted;
+    if (da_opus_feed(e, in, 1920, emit) != 0 || emitted - before != 2) {
+        fprintf(stderr, "reset: expected 2 packets from 40 ms, got %d\n", emitted - before); return 1;
+    }
+    printf("opus smoke ok: %d packets (reset ok)\n", emitted);
     da_opus_free(e);
     free(in);
     return 0;

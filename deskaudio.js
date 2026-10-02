@@ -14,7 +14,7 @@ module.exports.deskaudio = function (parent) {
     var obj = {};
     obj.parent = parent;
     obj.meshServer = parent.parent;
-    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setRate', 'setCodec', 'setBitrate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_playerCore', 'probeCodecs', '_ensureCtx', '_ensureOpusDecoder', '_pushDecoded', '_opusChunk', '_teardown'];
+    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setRate', 'setCodec', 'setBitrate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_playerCore', 'probeCodecs', '_ensureCtx', '_ensureOpusDecoder', '_pushDecoded', '_opusChunk', '_teardown', 'log', 'onLog', 'copyLog', 'clearLog', 'toggleLog', '_stats'];
 
     var fs = require('fs');
     var path = require('path');
@@ -377,6 +377,10 @@ module.exports.deskaudio = function (parent) {
                 }
                 st.listeners.forEach(function (s) { sendStatus(s, nodeid, state, code, msg, { rate: command.rate, timeout: command.timeout }); });
                 break;
+            case 'log':
+                var line = String(command.msg || '').substring(0, 300);
+                if (line) st.listeners.forEach(function (s) { sendUser(s, { method: 'onLog', nodeid: nodeid, msg: line }); });
+                break;
             case 'consentresult':
                 var sess = st.pending[command.reqid];
                 if (!sess) return;
@@ -444,7 +448,13 @@ module.exports.deskaudio = function (parent) {
             '<option value="high">Высокий — стабильнее при рывках</option></select></div>' +
             '<div style="margin:5px 0"><label><input type="checkbox" id="da_auto" onchange="' + H + '.setAuto(this.checked)"> ' +
             'Слушать звук при подключении к рабочему столу</label></div>' +
-            '</fieldset></div>');
+            '</fieldset>' +
+            '<details id="da_logbox" style="margin:10px 0 0" ontoggle="' + H + '.toggleLog(this.open)">' +
+            '<summary style="cursor:pointer;opacity:.8;font-size:12px">Журнал</summary>' +
+            '<div style="margin:6px 0 4px"><input type="button" id="da_logcopy" value="Копировать" onclick="' + H + '.copyLog()"> ' +
+            '<input type="button" id="da_logclear" value="Очистить" onclick="' + H + '.clearLog()"></div>' +
+            '<pre id="da_log" style="margin:0;max-height:240px;overflow:auto;font-size:11px;line-height:1.35;white-space:pre-wrap;' +
+            'background:rgba(128,128,128,.12);border-radius:4px;padding:6px"></pre></details></div>');
         function setSel(id, val) { var e = document.getElementById(id); if (e) e.value = val; }
         function setChk(id, on) { var e = document.getElementById(id); if (e) e.checked = on; }
         setSel('da_rate', pref('rate', '16000'));
@@ -458,14 +468,29 @@ module.exports.deskaudio = function (parent) {
         setSel('da_buffer', pref('buffer', 'med'));
         setChk('da_silence', pref('silence', '1') !== '0');
         setChk('da_auto', pref('auto', '0') === '1');
+        var lb = document.getElementById('da_logbox');
+        if (lb && pref('logopen', '0') === '1') lb.open = true;
+        P.log(null);                                            // fill the (re)built log view
         try { var vv = document.getElementById('da_vol'); var sv = pref('vol', null); if (sv !== null && vv) vv.value = sv; } catch (e) { }
 
         // Button in the Desktop tab's official custom-UI slot (survives version changes).
+        // It takes its look from MeshCentral's own «Actions» button, so it matches
+        // whichever UI is in use (classic: class "mR"; modern: "btn btn-primary
+        // btn-sm me-1") and any custom theme.
+        var ref = document.getElementById('deskActionsBtn') || document.getElementById('deskActionsSettings');
+        // The tab's own buttons get the same look.
+        if (ref && ref.className) ['da_btn', 'da_logcopy', 'da_logclear'].forEach(function (id) {
+            var e = document.getElementById(id); if (e) e.className = ref.className;
+        });
         var slot = document.getElementById('desktopCustomUiButtons');
         if (slot && !document.getElementById('da_deskbtn')) {
             var db = document.createElement('input');
             db.type = 'button'; db.id = 'da_deskbtn';
             db.title = 'Слушать звук рабочего стола';
+            if (ref && ref.className) db.className = ref.className;
+            db.style.cssText = 'float:left';
+            db.onkeypress = function () { return false; };      // like MeshCentral's buttons: keys go to the desktop
+            db.onkeydown = function () { return false; };
             db.onclick = function () { pluginHandler.deskaudio.toggle(); };
             slot.appendChild(db);
         }
@@ -514,7 +539,7 @@ module.exports.deskaudio = function (parent) {
         var st = document.getElementById('da_status');
         if (st) st.textContent = s.statusText || '';
         var db = document.getElementById('da_deskbtn');
-        if (db) db.value = s.active ? '⏹ Звук' : '🔊 Звук';
+        if (db) db.value = s.active ? 'Стоп звук' : 'Звук';
         var ind = document.getElementById('da_deskind');
         if (ind) ind.style.display = s.active ? '' : 'none';
         if (!s.active) { var bar = document.getElementById('da_bar'); if (bar) bar.style.width = '0'; }
@@ -585,9 +610,14 @@ module.exports.deskaudio = function (parent) {
         }, 10000);
         var msg = { action: 'plugin', plugin: 'deskaudio', pluginaction: 'start', nodeid: s.nodeid, rate: rate,
                     compress: codec !== 'pcm', silence: g('silence', '1') !== '0', bitrate: parseInt(g('bitrate', '32'), 10) };
+        P.log('старт: ' + (currentNode.name || s.nodeid) + ', кодек «' + codec + '», ' + (rate / 1000) + ' кГц, буфер ' +
+              Math.round(s.jitter * 1000) + ' мс, тишину ' + (msg.silence ? 'не передавать' : 'передавать') +
+              (codec === 'opus' || codec === 'auto' ? ', Opus ' + msg.bitrate + ' кбит/с' : ''));
+        s.rxBytes = 0; s.rxMsgs = 0; s.statsAt = Date.now();
         function send(codecs) {
             if (!s.active || s.nodeid !== msg.nodeid) return;    // stopped while probing
             s.codecs = msg.codecs = codecs;
+            P.log('браузер умеет: ' + codecs.join(', ') + ' — запрос отправлен');
             meshserver.send(msg);
         }
         if (codec === 'opus' || codec === 'adpcm' || codec === 'pcm') send([codec]);
@@ -599,7 +629,10 @@ module.exports.deskaudio = function (parent) {
         var P = pluginHandler.deskaudio;
         var s = P._s = P._s || {};
         if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }
-        if (s.nodeid && s.active) meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'stop', nodeid: s.nodeid });
+        if (s.nodeid && s.active) {
+            meshserver.send({ action: 'plugin', plugin: 'deskaudio', pluginaction: 'stop', nodeid: s.nodeid });
+            P.log('остановлено');
+        }
         P._teardown(s);
         s.active = false; s.statusText = 'Остановлено';
         P.render();
@@ -644,6 +677,8 @@ module.exports.deskaudio = function (parent) {
         var P = pluginHandler.deskaudio;
         var s = P._s = P._s || {};
         if (!m || m.nodeid !== s.nodeid) return;
+        P.log('статус: ' + m.state + (m.codec ? ', кодек ' + m.codec : '') + (m.rate ? ', ' + (m.rate / 1000) + ' кГц' : '') +
+              (m.code ? ' [' + m.code + ']' : '') + (m.msg ? ' — ' + String(m.msg).trim() : ''));
         if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }  // agent responded
         if (m.state === 'started') s.statusText = 'Идёт передача звука' + (m.rate ? ' (' + (m.rate / 1000) + ' кГц)' : '');
         else if (m.state === 'waiting') {
@@ -800,7 +835,8 @@ module.exports.deskaudio = function (parent) {
         // Ask for the stream's rate so nothing is resampled. A browser that
         // refuses keeps its own rate; the player then resamples.
         try { s.ctx = new AC({ sampleRate: rate }); } catch (e) { s.ctx = null; }
-        if (!s.ctx) { try { s.ctx = new AC(); } catch (e) { return; } }
+        if (!s.ctx) { try { s.ctx = new AC(); } catch (e) { P.log('ошибка: не удалось создать AudioContext: ' + e); return; } }
+        P.log('AudioContext: ' + s.ctx.sampleRate + ' Гц (запрошено ' + rate + ')');
         if (s.ctx.resume) s.ctx.resume();
         s.gain = s.ctx.createGain();
         s.gain.gain.value = (s.vol !== undefined) ? s.vol : 0.8;
@@ -810,11 +846,14 @@ module.exports.deskaudio = function (parent) {
         if (s.ctx.audioWorklet && typeof Blob !== 'undefined' && typeof URL !== 'undefined' && URL.createObjectURL) {
             var code = 'var Player = (' + P._playerCore.toString() + ')();\n' +
                 'class DeskAudioProcessor extends AudioWorkletProcessor {\n' +
-                '  constructor() { super(); this.p = new Player(sampleRate);\n' +
+                '  constructor() { super(); this.p = new Player(sampleRate); this.n = 0;\n' +
                 '    this.port.onmessage = (e) => { const d = e.data;\n' +
                 '      if (d.jitter) this.p.setJitter(d.jitter);\n' +
                 '      if (d.s) this.p.push(d.s, d.rate); }; }\n' +
-                '  process(inputs, outputs) { this.p.render(outputs[0][0]); return true; }\n' +
+                '  process(inputs, outputs) { this.p.render(outputs[0][0]);\n' +
+                '    if (++this.n >= 375) { this.n = 0; const p = this.p;\n' +
+                '      this.port.postMessage({ stats: { fill: p.inRate ? p.fill() / p.inRate : 0, underruns: p.underruns, skips: p.skips } }); }\n' +
+                '    return true; }\n' +
                 '}\n' +
                 "registerProcessor('deskaudio-processor', DeskAudioProcessor);\n";
             try {
@@ -825,15 +864,24 @@ module.exports.deskaudio = function (parent) {
                     if (s.ctx !== ctx) return;              // stopped meanwhile
                     s.node = new AudioWorkletNode(ctx, 'deskaudio-processor', { numberOfInputs: 0, outputChannelCount: [1] });
                     s.node.connect(s.gain);
+                    // The worklet reports about once a second, also during silence;
+                    // that is the clock for the periodic log line (no timers).
+                    s.node.port.onmessage = function (e) { if (e.data && e.data.stats) { s.player = e.data.stats; P._stats(); } };
                     s.node.port.postMessage({ jitter: s.jitter || 0.15 });
                     var q = s.pending || [];
                     s.pending = null;
                     for (var i = 0; i < q.length; i++) s.node.port.postMessage({ s: q[i].f, rate: q[i].rate }, [q[i].f.buffer]);
-                }).catch(function () { if (s.ctx === ctx) s.pending = null; });   // -> fallback scheduler
+                    P.log('плеер: AudioWorklet (джиттер-буфер ' + Math.round((s.jitter || 0.15) * 1000) + ' мс)');
+                }).catch(function (e) {
+                    if (s.ctx !== ctx) return;
+                    s.pending = null;                                        // -> fallback scheduler
+                    P.log('плеер: AudioWorklet не загрузился (' + e + ') — простой планировщик');
+                });
                 return;
             } catch (e) { }
         }
         s.pending = null;                               // no AudioWorklet: fallback scheduler
+        P.log('плеер: AudioWorklet недоступен — простой планировщик');
     };
 
     // Decoded PCM from any codec, at its own rate: to the worklet player (or,
@@ -846,6 +894,7 @@ module.exports.deskaudio = function (parent) {
         if (!s.gotAudio) {
             s.gotAudio = true;
             if (s.connectTimer) { clearTimeout(s.connectTimer); s.connectTimer = null; }
+            pluginHandler.deskaudio.log('первый звук: ' + (s.codecName || '?') + ', ' + rate + ' Гц');
             s.statusText = 'Идёт передача звука (' + (s.codecName || '') + (s.codecName ? ', ' : '') + (rate / 1000) + ' кГц)';
             pluginHandler.deskaudio.render();
         }
@@ -890,9 +939,10 @@ module.exports.deskaudio = function (parent) {
                     } catch (e) { }
                     try { frame.close(); } catch (e) { }
                 },
-                error: function () {
+                error: function (err) {
                     var P = pluginHandler.deskaudio, st = P._s || {};
                     if (st.opusDec !== dec) return;
+                    P.log('ошибка декодера Opus: ' + (err && (err.message || err)));
                     P.stop();
                     st.statusText = 'Ошибка декодирования Opus — выберите ADPCM в настройках';
                     P.render();
@@ -912,6 +962,7 @@ module.exports.deskaudio = function (parent) {
         var P = pluginHandler.deskaudio;
         var dec = P._ensureOpusDecoder(s);
         if (!dec) {
+            P.log('ошибка: пришёл Opus, а WebCodecs AudioDecoder недоступен');
             P.stop();
             s.statusText = 'Браузер не поддерживает декодирование Opus — выберите ADPCM в настройках';
             P.render();
@@ -941,6 +992,8 @@ module.exports.deskaudio = function (parent) {
         var P = pluginHandler.deskaudio;
         var s = (P._s || {});
         if (!s.active || !m || m.nodeid !== s.nodeid || typeof m.d !== 'string') return;
+        s.rxBytes = (s.rxBytes || 0) + m.d.length * 3 / 4; s.rxMsgs = (s.rxMsgs || 0) + 1;
+        if (!s.node) P._stats();                // no worklet clock: the chunks drive the stats line
         var opus = (m.codec === 'opus' || m.codec === 'opus2');
         var rate = opus ? 48000 : (m.rate || 16000);
         P._ensureCtx(s, rate);
@@ -971,9 +1024,62 @@ module.exports.deskaudio = function (parent) {
         try { if (s.workletUrl) URL.revokeObjectURL(s.workletUrl); } catch (e) { }
         try { if (s.opusDec && s.opusDec.state !== 'closed') s.opusDec.close(); } catch (e) { }
         try { if (s.ctx) s.ctx.close(); } catch (e) { }
+        s.player = null;
         s.node = null; s.workletUrl = null; s.pending = null; s.opusDec = null; s.opusTs = 0;
         s.ctx = null; s.gain = null; s.codecName = '';
     };
+
+    // ---- Log window ----------------------------------------------------
+    // A per-page diagnostic log shown in the «Журнал» box of the tab: what was
+    // requested, what the agent answered, helper messages (device, format,
+    // reopen), and periodic stream statistics. log(null) only redraws.
+    obj.log = function (text) {
+        // Diagnostics must never break audio: tolerate a missing page context.
+        if (typeof pluginHandler === 'undefined' || !pluginHandler.deskaudio) return;
+        var P = pluginHandler.deskaudio;
+        var L = P._log = P._log || [];
+        if (text !== null && text !== undefined) {
+            var d = new Date();
+            function two(n) { return (n < 10 ? '0' : '') + n; }
+            L.push(two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds()) + '  ' + text);
+            if (L.length > 300) L.splice(0, L.length - 300);
+        }
+        var el = (typeof document !== 'undefined') ? document.getElementById('da_log') : null;
+        if (el) { el.textContent = L.join('\n'); el.scrollTop = el.scrollHeight; }
+    };
+
+    // Agent-side lines (helper launch, capture format, device changes).
+    obj.onLog = function (a, b) {
+        var m = (b !== undefined && b !== null) ? b : a;
+        var P = pluginHandler.deskaudio, s = P._s || {};
+        if (!m || m.nodeid !== s.nodeid || typeof m.msg !== 'string') return;
+        P.log('агент: ' + m.msg);
+    };
+
+    // Every 5 s while listening: received bitrate and the player's state.
+    obj._stats = function () {
+        var P = pluginHandler.deskaudio, s = P._s || {};
+        if (!s.active) return;
+        var now = Date.now(), dt = (now - (s.statsAt || now)) / 1000;
+        if (dt < 5) return;
+        var line = 'поток: ' + Math.round((s.rxBytes || 0) * 8 / 1000 / dt) + ' кбит/с, ' + (Math.round((s.rxMsgs || 0) / dt * 10) / 10) + ' сообщ./с';
+        if (s.player) line += ', в буфере ' + Math.round(s.player.fill * 1000) + ' мс, опустошений ' + s.player.underruns + ', сбросов ' + s.player.skips;
+        if (!s.rxMsgs) line += (s.gotAudio ? ' (тишина — агент не передаёт)' : ' (данных ещё нет)');
+        P.log(line);
+        s.rxBytes = 0; s.rxMsgs = 0; s.statsAt = now;
+    };
+
+    obj.copyLog = function () {
+        var text = (pluginHandler.deskaudio._log || []).join('\n');
+        try { if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(text); return; } } catch (e) { }
+        var el = document.getElementById('da_log');
+        if (el && window.getSelection) { var r = document.createRange(); r.selectNodeContents(el); var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r); }
+        try { document.execCommand('copy'); } catch (e) { }
+    };
+
+    obj.clearLog = function () { pluginHandler.deskaudio._log = []; pluginHandler.deskaudio.log(null); };
+
+    obj.toggleLog = function (open) { try { localStorage.setItem('deskaudio_logopen', open ? '1' : '0'); } catch (e) { } };
 
     return obj;
 };

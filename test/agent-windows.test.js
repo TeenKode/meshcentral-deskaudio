@@ -173,6 +173,37 @@ describe("agent (Windows)", { skip: !isWin ? "windows-only: runs on the windows 
         });
     });
 
+    test("multi-packet Opus frames (flag 0x08) are relayed as opus2, split anywhere", () => {
+        withWinAgent(({ ag, calls, sent, parent }) => {
+            startAct(ag, parent, { codec: "opus", bitrate: 32 });
+            assert.ok(calls[0].args.includes("opus") && calls[0].args.includes("kbps=32"), "helper told to encode opus");
+            const pkt = (len) => Buffer.concat([Buffer.from([0xC0, 0x03, len, 0]), Buffer.alloc(len, 9)]);
+            const payload = Buffer.concat([pkt(3), pkt(4)]);
+            const frame = Buffer.concat([Buffer.from([payload.length, 0, 0x08]), payload]);
+            const silence = Buffer.from([0, 0, 0x01]);
+            const stream = Buffer.concat([frame, silence, frame]);
+            for (let i = 0; i < stream.length; i += 2) calls[0].child.stdout.emit("data", stream.subarray(i, i + 2));
+            const chunks = sent.filter((m) => m.pluginaction === "chunk");
+            assert.strictEqual(chunks.length, 2, "two frames, the silent one skipped");
+            for (const c of chunks) {
+                assert.strictEqual(c.codec, "opus2");
+                assert.deepStrictEqual(Buffer.from(c.d, "base64"), payload);
+            }
+        });
+    });
+
+    test("helper stderr lines reach the browser log, rate-limited", () => {
+        withWinAgent(({ ag, calls, sent, parent }) => {
+            startAct(ag, parent, {});
+            calls[0].child.stderr.emit("data", Buffer.from("capture: 48000 Hz, 2 ch, float32 -> 16000 Hz adpcm\n"));
+            const logs = sent.filter((m) => m.pluginaction === "log");
+            assert.ok(logs.some((m) => /helper .*deskaudio-helper\.exe/.test(m.msg)), "helper launch is logged");
+            assert.ok(logs.some((m) => m.msg === "capture: 48000 Hz, 2 ch, float32 -> 16000 Hz adpcm"), "stderr line forwarded");
+            for (let i = 0; i < 100; i++) calls[0].child.stderr.emit("data", Buffer.from("spam " + i + "\n"));
+            assert.ok(sent.filter((m) => m.pluginaction === "log").length <= 30, "at most 30 log lines a minute");
+        });
+    });
+
     // ---- dropFile itself is platform-independent; keep it here so the
     // Windows runner exercises the exact helper-drop code path. ----
     test("dropFile writes the helper, reuses an identical file, replaces a planted one", () => {

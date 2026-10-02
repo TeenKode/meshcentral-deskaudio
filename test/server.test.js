@@ -564,3 +564,16 @@ test("an agent that fell back from Opus (Linux) lets ADPCM-only listeners join",
     userStart(obj, b, web, { codecs: ["adpcm", "pcm"] });
     assert.strictEqual(lastStatus(b.ws).state, "started");
 });
+
+test("agent log lines are relayed to the listeners' log windows", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const sess = makeUserSession();
+    userStart(obj, sess, makeWeb());
+    const sid = agentStarts(agent)[0].sid;
+    agentMsg(obj, agent, { pluginaction: "log", sid, msg: "capture: 48000 Hz, 2 ch" + "x".repeat(400) });
+    agentMsg(obj, agent, { pluginaction: "log", sid: sid + 99, msg: "stale" });
+    const logs = sess.ws.sent.filter((m) => m.method === "onLog");
+    assert.strictEqual(logs.length, 1, "stale-session lines are dropped");
+    assert.ok(logs[0].msg.startsWith("capture: 48000 Hz") && logs[0].msg.length === 300, "truncated to 300 chars");
+});

@@ -34,6 +34,16 @@ function send(o) {
     try { ((mesh && mesh.SendCommand) ? mesh : require('MeshAgent')).SendCommand(o); } catch (e) { }
 }
 
+// A line for the plugin's log window in the browser. At most LOG_MAX lines per
+// minute, so a misbehaving helper cannot flood the control channel.
+var LOG_MAX = 30, logCount = 0, logWindow = 0;
+function log(text, sid) {
+    var now = Date.now();
+    if (now - logWindow > 60000) { logWindow = now; logCount = 0; }
+    if (++logCount > LOG_MAX) return;
+    send({ pluginaction: 'log', sid: (sid === undefined) ? curSid : sid, msg: String(text).substring(0, 300) });
+}
+
 function fail(msg, code, sid) {
     send({ pluginaction: 'status', sid: (sid === undefined) ? curSid : sid, state: 'error', code: code || 'helper_failed', msg: String(msg) });
 }
@@ -119,7 +129,8 @@ function startWatch() {
 function stopWatch() { if (watchdog != null) { clearInterval(watchdog); watchdog = null; } }
 
 // Native helper protocol: stdout carries [len:2 LE][flags:1][payload] frames.
-// flags bit0 = silence (empty payload — skip it), bit1 = ADPCM payload. The
+// flags bit0 = silence (empty payload — skip it), bit1 = ADPCM payload,
+// bit2 = one Opus packet, bit3 = several Opus packets ('opus2'). The
 // agent only re-frames and base64-encodes: no DSP in Duktape anymore.
 // Stream chunks can split frames at arbitrary byte offsets, so a partial
 // frame is carried over between 'data' events.
@@ -156,7 +167,8 @@ function feedFramed(x, sid) {
         if (frameRem.got === frameRem.need) {
             var f = frameRem; frameRem = null;
             var msg = { pluginaction: 'chunk', sid: sid, rate: curRate, d: f.buf.toString('base64') };
-            if ((f.flags & 0x04) !== 0) msg.codec = 'opus';        // 48 kHz packet; rate says the capture rate
+            if ((f.flags & 0x08) !== 0) msg.codec = 'opus2';       // several 48 kHz packets
+            else if ((f.flags & 0x04) !== 0) msg.codec = 'opus';   // 48 kHz packet; rate says the capture rate
             else if ((f.flags & 0x02) !== 0) msg.codec = 'adpcm';  // the browser picks its decoder by this
             send(msg);
         }
@@ -170,8 +182,12 @@ function run(path, args, framed) {
     child = c;
     frameRem = null;
     c.stderr.on('data', function (x) {
-        errBuf += x.toString();
+        var t = x.toString();
+        errBuf += t;
         if (errBuf.length > 2000) errBuf = errBuf.slice(-2000);
+        // Helper diagnostics go to the plugin's log in the browser (rate-limited).
+        var lines = t.split('\n');
+        for (var i = 0; i < lines.length; i++) if (lines[i].trim()) log(lines[i].trim(), sid);
     });
     c.stdout.on('data', function (x) {
         if (child !== c) return;
@@ -203,6 +219,7 @@ function startLinux(a) {
     // no native Opus helper on Linux yet, so an opus request degrades.
     if (curCodec === 'opus') { curCodec = null; curCompress = true; }
     var script = Buffer.from(a.script, 'base64').toString();
+    log('linux capture via parec, ' + curRate + ' Hz, ' + (curCompress ? 'adpcm' : 'pcm') + (a.codec === 'opus' ? ' (opus is not available on Linux)' : ''));
     run('/bin/sh', ['sh', '-c', script, 'deskaudio', String(curRate)]);
 }
 
@@ -271,7 +288,10 @@ function startWin(a) {
     if (curSilence) hargs.push('silence');
     for (var i = 0; i < names.length; i++) {
         var p = dropFile(fs, dir, names[i], data);
-        if (p) return run(p, hargs, true);
+        if (p) {
+            log('helper ' + p + ' (' + (arch || '?') + ', ' + data.length + ' bytes) ' + hargs.slice(1).join(' '));
+            return run(p, hargs, true);
+        }
     }
     fail('Не удалось записать хелпер в папку агента: ' + dir, 'helper_write');
 }

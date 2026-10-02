@@ -4,12 +4,15 @@
 //   flags bit0 (0x01) = silence: the payload is empty; the receiver keeps
 //                       the stream continuous but sends nothing over the air
 //   flags bit1 (0x02) = payload is ADPCM (each frame a self-contained block)
-//   flags bit2 (0x04) = payload is an Opus packet (self-contained 20 ms);
-//                       payload layout [dur:2 LE][opus bytes]
+//   flags bit2 (0x04) = payload is one Opus packet: [dur:2 LE][opus bytes]
+//                       (helpers up to 1.0.3)
+//   flags bit3 (0x08) = payload is several Opus packets, each
+//                       [dur:2 LE][len:2 LE][opus bytes] - one frame per 40 ms
 //   flags 0x00        = payload is raw s16le PCM.
-// A frame is emitted at most every FLUSH_MS of audio. Frame boundaries are
-// independent of WASAPI packet boundaries: partial frames are kept back.
-// Arguments:  deskaudio.exe <rate> [adpcm|pcm] [silence]
+// dur is in 48 kHz samples. A frame is emitted every FLUSH_MS of audio. Frame
+// boundaries are independent of WASAPI packet boundaries: partial frames are
+// kept back.
+// Arguments:  deskaudio.exe <rate> [adpcm|pcm|opus] [kbps=N] [silence]
 //
 // Depends only on system DLLs present on every Windows since Vista/7 (ole32).
 // Cross-compiled from Linux with MinGW-w64, statically linked so the produced
@@ -59,25 +62,61 @@ static int fail(const char* msg, HRESULT hr) {
 // capture; the counter resets once a device opens successfully.
 static const int REOPEN_MAX_ATTEMPTS = 10;
 
+// Follows the default render device. Switching the default output (plugging in
+// headphones, choosing another device in Windows) does not invalidate a
+// loopback stream on the old device - it just goes quiet - so the helper
+// listens for OnDefaultDeviceChanged and reopens the new default.
+// A single static instance lives for the whole process, so reference counting
+// never frees it (and no operator new/delete is linked in).
+class DefaultDeviceWatcher : public IMMNotificationClient {
+    volatile LONG changed_;
+public:
+    DefaultDeviceWatcher() : changed_(0) {}
+    bool takeChanged() { return InterlockedExchange(&changed_, 0) != 0; }
+    ULONG STDMETHODCALLTYPE AddRef() { return 2; }
+    ULONG STDMETHODCALLTYPE Release() { return 1; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) {
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMMNotificationClient)) { *ppv = this; AddRef(); return S_OK; }
+        *ppv = NULL; return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) {
+        if (flow == eRender && role == eConsole) InterlockedExchange(&changed_, 1);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) { return S_OK; }
+};
+static DefaultDeviceWatcher g_watcher;
+
 #ifdef DA_BUILD_OPUS
 static DaOpusEnc* op = NULL;
 
-// Frame writer for da_opus_feed: [dur:2][opus packet] payload with the
-// opus frame flag. Duration is in 48 kHz samples (the browser sizes its
-// ring push from it).
-static void emit_opus_frame(int len, const unsigned char* pkt, int dur) {
+// The packets of one 40 ms block are collected here and written as a single
+// multi-packet frame (flag 0x08): one message per 40 ms instead of one per
+// 20 ms halves the per-message overhead on the agent/server/browser path.
+static unsigned char opusBatch[2 * (4 + sizeof(((DaOpusEnc*)0)->pkt))];
+static int opusBatchLen = 0;
+
+static void collect_opus_packet(int len, const unsigned char* pkt, int dur) {
+    if (opusBatchLen + 4 + len > (int)sizeof(opusBatch)) return;   // cannot happen at <=48 kbps
+    unsigned char* p = opusBatch + opusBatchLen;
+    p[0] = (unsigned char)(dur & 0xFF); p[1] = (unsigned char)((dur >> 8) & 0xFF);
+    p[2] = (unsigned char)(len & 0xFF); p[3] = (unsigned char)((len >> 8) & 0xFF);
+    memcpy(p + 4, pkt, len);
+    opusBatchLen += 4 + len;
+}
+
+static void flush_opus_batch() {
+    if (opusBatchLen == 0) return;
     unsigned char hdr[3];
-    int payload = 2 + len;
-    hdr[0] = (unsigned char)(payload & 0xFF);
-    hdr[1] = (unsigned char)((payload >> 8) & 0xFF);
-    hdr[2] = 0x04;      // Opus payload
+    hdr[0] = (unsigned char)(opusBatchLen & 0xFF);
+    hdr[1] = (unsigned char)((opusBatchLen >> 8) & 0xFF);
+    hdr[2] = 0x08;      // several Opus packets
     fwrite(hdr, 1, 3, stdout);
-    unsigned char d[2];
-    d[0] = (unsigned char)(dur & 0xFF);
-    d[1] = (unsigned char)((dur >> 8) & 0xFF);
-    fwrite(d, 1, 2, stdout);
-    fwrite(pkt, 1, len, stdout);
-    fflush(stdout);
+    fwrite(opusBatch, 1, opusBatchLen, stdout);
+    opusBatchLen = 0;
 }
 #endif
 
@@ -125,24 +164,39 @@ int main(int argc, char** argv) {
                           __uuidof(IMMDeviceEnumerator), (void**)&pEnum);
     if (FAILED(hr)) return fail("CoCreateInstance(MMDeviceEnumerator) failed", hr);
 
-    // The old helper exited (code 0) on AUDCLNT_E_DEVICE_INVALIDATED, which the
-    // UI reported as a plain "stopped". Instead, keep running across device
-    // changes: release and reopen whatever is now the default render device.
+    DefaultDeviceWatcher* watcher = &g_watcher;
+    bool watching = SUCCEEDED(pEnum->RegisterEndpointNotificationCallback(watcher));
+
+    // Keep running across device changes: release and reopen whatever is now
+    // the default render device. `misses` counts consecutive attempts that did
+    // not lead to a working capture - an open step failing, or a capture that
+    // died within MIN_GOOD_MS - so a device that opens but never works (e.g.
+    // held in exclusive mode by another app) ends the helper with an error
+    // instead of retrying forever.
+    const DWORD MIN_GOOD_MS = 2000;
     int misses = 0;
+    const char* lastStep = "capture";      // what failed last, for the error message
+    HRESULT lastHr = 0;
     for (;;) {
-        if (misses >= REOPEN_MAX_ATTEMPTS) { pEnum->Release(); CoUninitialize(); return fail("audio device unavailable", 0); }
+        if (misses >= REOPEN_MAX_ATTEMPTS) {
+            if (watching) pEnum->UnregisterEndpointNotificationCallback(watcher);
+            pEnum->Release(); CoUninitialize();
+            char msg[160];
+            snprintf(msg, sizeof msg, "audio device unavailable: %s failed", lastStep);
+            return fail(msg, lastHr);
+        }
+        watcher->takeChanged();             // opening the current default now
         IMMDevice* pDevice = NULL;
         hr = pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
-        if (FAILED(hr)) { misses++; Sleep(300); continue; }
-        misses = 0;
+        if (FAILED(hr)) { lastStep = "GetDefaultAudioEndpoint"; lastHr = hr; misses++; Sleep(300); continue; }
 
         IAudioClient* pClient = NULL;
         hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pClient);
-        if (FAILED(hr)) { pDevice->Release(); misses++; Sleep(300); continue; }
+        if (FAILED(hr)) { lastStep = "Activate"; lastHr = hr; pDevice->Release(); misses++; Sleep(300); continue; }
 
         WAVEFORMATEX* pwfx = NULL;
         hr = pClient->GetMixFormat(&pwfx);
-        if (FAILED(hr)) { pClient->Release(); pDevice->Release(); misses++; Sleep(300); continue; }
+        if (FAILED(hr)) { lastStep = "GetMixFormat"; lastHr = hr; pClient->Release(); pDevice->Release(); misses++; Sleep(300); continue; }
 
         int ch = pwfx->nChannels;
         int srcRate = (int)pwfx->nSamplesPerSec;
@@ -154,28 +208,34 @@ int main(int argc, char** argv) {
         }
         if (!((isFloat && bits == 32) || (!isFloat && bits == 16))) {
             // A nonstandard mix format is unlikely to change on reopen; give up.
-            CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release(); pEnum->Release(); CoUninitialize();
+            CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release();
+            if (watching) pEnum->UnregisterEndpointNotificationCallback(watcher);
+            pEnum->Release(); CoUninitialize();
             return fail("Unsupported mix format", 0);
         }
 
         hr = pClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
                                  10000000 /*1 s*/, 0, pwfx, NULL);
-        if (FAILED(hr)) { CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release(); misses++; Sleep(300); continue; }
+        if (FAILED(hr)) { lastStep = "Initialize"; lastHr = hr; CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release(); misses++; Sleep(300); continue; }
 
         IAudioCaptureClient* pCapture = NULL;
         hr = pClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCapture);
-        if (FAILED(hr)) { CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release(); misses++; Sleep(300); continue; }
+        if (FAILED(hr)) { lastStep = "GetService"; lastHr = hr; CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release(); misses++; Sleep(300); continue; }
 
         hr = pClient->Start();
-        if (FAILED(hr)) { pCapture->Release(); CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release(); misses++; Sleep(300); continue; }
+        if (FAILED(hr)) { lastStep = "Start"; lastHr = hr; pCapture->Release(); CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release(); misses++; Sleep(300); continue; }
 
         // SpeexDSP resampler: proper anti-aliasing before decimation to dstRate.
         // The old code averaged every `step`-th group of samples, which passes
         // everything above dstRate/2 through as folded noise (aliasing).
         int resErr = 0;
         SpeexResamplerState* res = deskaudio_resampler_init(1, (spx_uint32_t)srcRate, (spx_uint32_t)dstRate, 5, &resErr);
-        if (!res) { pCapture->Release(); CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release(); pEnum->Release(); CoUninitialize(); return fail("resampler init failed", resErr); }
+        if (!res) { lastStep = "resampler init"; lastHr = (HRESULT)resErr; pCapture->Release(); CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release(); misses++; Sleep(300); continue; }
         deskaudio_resampler_skip_zeros(res);
+        // One line per (re)open: shown in the plugin's log in the browser.
+        fprintf(stderr, "capture: %d Hz, %d ch, %s -> %d Hz %s%s\n", srcRate, ch, isFloat ? "float32" : "int16",
+                dstRate, useOpus ? "opus" : (useAdpcm ? "adpcm" : "pcm"), suppressSilence ? ", silence suppressed" : "");
+        fflush(stderr);
 
         // Down-mix to mono in place, then resample. A packet is up to a few
         // hundred frames; 64k frames covers ~0.7 s at 96 kHz stereo worst case.
@@ -193,12 +253,16 @@ int main(int argc, char** argv) {
         unsigned char* enc = (unsigned char*)malloc(encCap);
         if (!mono || !rOut || !pend || !enc) {
             free(mono); free(rOut); free(pend); free(enc);
-            deskaudio_resampler_destroy(res); pCapture->Release(); CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release(); pEnum->Release(); CoUninitialize();
+            deskaudio_resampler_destroy(res); pCapture->Release(); CoTaskMemFree(pwfx); pClient->Release(); pDevice->Release();
+            if (watching) pEnum->UnregisterEndpointNotificationCallback(watcher);
+            pEnum->Release(); CoUninitialize();
             return fail("out of memory", 0);
         }
 
-        bool fatal = false;
+        bool fatal = false, switched = false, wasSilent = false;
+        DWORD openedAt = GetTickCount();
         for (;;) {
+            if (watcher->takeChanged()) { switched = true; break; }   // new default output: reopen
             UINT32 pkt = 0;
             hr = pCapture->GetNextPacketSize(&pkt);
             if (FAILED(hr)) break;   // device invalidated: reopen below
@@ -212,10 +276,12 @@ int main(int argc, char** argv) {
                 hr = pCapture->GetBuffer(&data, &frames, &flags, NULL, NULL);
                 if (FAILED(hr)) break;   // reopen below
                 bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-                if (frames > (UINT32)monoCap) frames = monoCap;   // never in practice
+                // ReleaseBuffer must get the full packet size, so only the
+                // down-mix is clamped (a packet is ~10 ms; never in practice).
+                UINT32 useFrames = (frames > (UINT32)monoCap) ? (UINT32)monoCap : frames;
                 const float* f = (const float*)data;
                 const short* s = (const short*)data;
-                for (UINT32 i = 0; i < frames; i++) {
+                for (UINT32 i = 0; i < useFrames; i++) {
                     double sum = 0.0;
                     if (!silent) {
                         for (int c = 0; c < ch; c++)
@@ -226,7 +292,7 @@ int main(int argc, char** argv) {
                     mono[i] = (short)lrint(v);
                 }
                 pCapture->ReleaseBuffer(frames);
-                spx_uint32_t inLen = frames, outLen = outCap;
+                spx_uint32_t inLen = useFrames, outLen = outCap;
                 deskaudio_resampler_process_int(res, 0, mono, &inLen, rOut, &outLen);
                 // Accumulate into the pending frame buffer; emit every
                 // frameSamples (40 ms) as one frame, independent of how WASAPI
@@ -237,20 +303,22 @@ int main(int argc, char** argv) {
                 }
                 while (pendLen >= frameSamples) {
                     int silent = allZero(pend, frameSamples);
-                    if (useOpus) {
-#ifdef DA_BUILD_OPUS
-                        // 20 ms Opus frames are cut on their own cadence by
-                        // da_opus_feed; this path handles the 40 ms chunking
-                        // by feeding everything through and letting the
-                        // encoder's own buffer split it.
-                        da_opus_feed(op, pend, frameSamples, emit_opus_frame);
-#endif
-                    } else if (suppressSilence && silent) {
+                    if (suppressSilence && silent) {
                         // keep the frame count honest but send no payload:
                         // a 3-byte frame with the silence flag
                         unsigned char hdr[3];
                         hdr[0] = 0; hdr[1] = 0; hdr[2] = 0x01;
                         fwrite(hdr, 1, 3, stdout);
+                        wasSilent = true;
+                    } else if (useOpus) {
+#ifdef DA_BUILD_OPUS
+                        // After a suppressed pause the encoder's history is
+                        // stale: start the new sound from a clean state.
+                        if (wasSilent) da_opus_reset(op);
+                        // 40 ms in -> two 20 ms packets out, sent as one frame.
+                        da_opus_feed(op, pend, frameSamples, collect_opus_packet);
+                        flush_opus_batch();
+#endif
                     } else if (useAdpcm) {
                         int n = da_adpcmEncode(pend, frameSamples, enc);
                         unsigned char hdr[3];
@@ -268,6 +336,7 @@ int main(int argc, char** argv) {
                         fwrite(hdr, 1, 3, stdout);
                         fwrite(pend, 1, n, stdout);
                     }
+                    if (!silent) wasSilent = false;
                     fflush(stdout);
                     memmove(pend, pend + frameSamples, (pendLen - frameSamples) * sizeof(short));
                     pendLen -= frameSamples;
@@ -290,13 +359,19 @@ int main(int argc, char** argv) {
 
         if (fatal) break;             // clean exit: agent closed stdout
         if (ferror(stdout)) break;
-        misses++;                     // the open device went bad: reopen
+        if (switched) { fprintf(stderr, "default output device changed: reopening\n"); fflush(stderr); continue; }
+        lastStep = "capture"; lastHr = hr;
+        fprintf(stderr, "capture interrupted (0x%08lX): reopening the default device\n", (unsigned long)hr); fflush(stderr);
+        // The open device went bad. Only a capture that ran for a while
+        // counts as "working"; one that dies right away is another miss.
+        if (GetTickCount() - openedAt >= MIN_GOOD_MS) misses = 1; else misses++;
         Sleep(300);
     }
 
 #ifdef DA_BUILD_OPUS
     if (op) { da_opus_free(op); op = NULL; }
 #endif
+    if (watching) pEnum->UnregisterEndpointNotificationCallback(watcher);
     pEnum->Release();
     CoUninitialize();
     return 0;
