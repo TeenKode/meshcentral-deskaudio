@@ -50,5 +50,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build and run the resampler test
         run: |
-          g++ -O2 -Wall -o /tmp/resample-test helpers/resample-test.c
+          cc -O2 -Wall -o /tmp/resample-test helpers/resample-test.c
           /tmp/resample-test
