@@ -457,6 +457,18 @@ test("a further listener on a notify-only device triggers a notification", () =>
     assert.strictEqual(agent.sent.filter((m) => m.pluginaction === "notify").length, 1);
 });
 
+test("the connection-toolbar flag notifies the remote user, without a prompt", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = consentWeb(64);
+    userStart(obj, makeUserSession({ userid: "user//a" }), web);
+    const c = agentStarts(agent)[0].consent;
+    assert.strictEqual(c.prompt, false, "no consent prompt");
+    assert.strictEqual(c.notify, true, "notified at the start");
+    userStart(obj, makeUserSession({ userid: "user//b" }), web);
+    assert.strictEqual(agent.sent.filter((m) => m.pluginaction === "notify").length, 1, "a further listener is notified too");
+});
+
 test("chunks with an invalid rate are dropped", () => {
     const { obj, meshServer } = loadPlugin();
     const agent = connectAgent(meshServer, NODE);
@@ -678,18 +690,18 @@ test("the end of listening is logged with its duration", () => {
         userStart(obj, b, web);
         Date.now = () => 1000000 + 125000;          // 2 min 5 s later
         userStop(obj, a, web);
-        let ends = meshServer.events.filter((e) => /конец/.test(e.msg));
+        let ends = meshServer.events.filter((e) => /ended/.test(e.msg));
         assert.strictEqual(ends.length, 1);
         assert.strictEqual(ends[0].userid, "user//a");
-        assert.match(ends[0].msg, /конец, 2 мин 5 с$/);
+        assert.match(ends[0].msg, /ended, 2 min 5 s$/);
 
         const sid = agent.sent.find((m) => m.pluginaction === "start").sid;
         agentMsg(obj, agent, { pluginaction: "status", sid, state: "error", code: "helper_failed", msg: "boom" });
-        ends = meshServer.events.filter((e) => /конец/.test(e.msg));
+        ends = meshServer.events.filter((e) => /ended/.test(e.msg));
         assert.strictEqual(ends.length, 2, "a stream ended by the agent is logged for the remaining listener");
         assert.match(ends[1].msg, /\(boom\)$/);
         userStop(obj, b, web);
-        assert.strictEqual(meshServer.events.filter((e) => /конец/.test(e.msg)).length, 2, "never logged twice");
+        assert.strictEqual(meshServer.events.filter((e) => /ended/.test(e.msg)).length, 2, "never logged twice");
     } finally { Date.now = realNow; }
 });
 
@@ -717,7 +729,7 @@ test("the sole listener can change the stream live: new capture, no new consent 
     agentMsg(obj, agent, { pluginaction: "status", sid: st2.sid, state: "started", proto: 3, rate: 24000, codec: "opus" });
     agentMsg(obj, agent, { pluginaction: "chunk", sid: st2.sid, rate: 24000, codec: "opus2", d: "TkVX" });
     assert.deepStrictEqual(sess.ws.sent.filter((m) => m.method === "onChunk").map((m) => m.d), ["TkVX"], "only the new capture is heard");
-    assert.strictEqual(meshServer.events.filter((e) => /конец/.test(e.msg)).length, 0, "still listening: no end logged");
+    assert.strictEqual(meshServer.events.filter((e) => /ended/.test(e.msg)).length, 0, "still listening: no end logged");
 });
 
 test("a shared stream is not reconfigured by one of its listeners", () => {

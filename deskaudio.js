@@ -26,6 +26,7 @@ module.exports.deskaudio = function (parent) {
     var MESHRIGHT_NODESKTOP = 0x00010000;
     var USERCONSENT_DesktopNotifyUser = 1;
     var USERCONSENT_DesktopPromptUser = 8;
+    var USERCONSENT_ShowConnectionToolbar = 64;
     var MAX_LISTENERS_PER_NODE = 10;
     var MAX_TOTAL_STREAMS = 50;   // server-wide cap on simultaneously captured devices
 
@@ -259,7 +260,7 @@ module.exports.deskaudio = function (parent) {
         if (mesh && typeof mesh.consent === 'number') c |= mesh.consent;
         if (typeof node.consent === 'number') c |= node.consent;
         if (user && typeof user.consent === 'number') c |= user.consent;
-        return c & (USERCONSENT_DesktopNotifyUser | USERCONSENT_DesktopPromptUser);
+        return c & (USERCONSENT_DesktopNotifyUser | USERCONSENT_DesktopPromptUser | USERCONSENT_ShowConnectionToolbar);
     }
 
     // What the agent needs to ask (or notify) the local user for one listener.
@@ -271,7 +272,10 @@ module.exports.deskaudio = function (parent) {
         var nmsg = (typeof cfg.notifymessage === 'string' && cfg.notifymessage) ? cfg.notifymessage : DEFAULT_NOTIFY_MSG;
         return {
             prompt: (flags & USERCONSENT_DesktopPromptUser) !== 0,
-            notify: (flags & USERCONSENT_DesktopNotifyUser) !== 0,
+            // The desktop's connection toolbar has no counterpart for audio (it
+            // belongs to the desktop session), so the remote user gets the
+            // notification instead: listening is never silent where the toolbar is on.
+            notify: (flags & (USERCONSENT_DesktopNotifyUser | USERCONSENT_ShowConnectionToolbar)) !== 0,
             title: (typeof cm.title === 'string') ? cm.title : 'MeshCentral',
             msg: cmsg.replace(/\{0\}/g, who),
             notifyMsg: nmsg.replace(/\{0\}/g, who),
@@ -292,8 +296,8 @@ module.exports.deskaudio = function (parent) {
         if (t0 === undefined) return;
         st.since.delete(sess);
         var sec = Math.round((Date.now() - t0) / 1000);
-        var dur = (sec >= 60 ? Math.floor(sec / 60) + ' мин ' : '') + (sec % 60) + ' с';
-        logEvent(sess, st.node, 'Прослушивание звука рабочего стола: конец, ' + dur + (why ? ' (' + why + ')' : ''));
+        var dur = (sec >= 60 ? Math.floor(sec / 60) + ' min ' : '') + (sec % 60) + ' s';
+        logEvent(sess, st.node, 'Desktop audio listening ended, ' + dur + (why ? ' (' + why + ')' : ''));
     }
 
     // Tell the agent to (re)start capturing for stream `st` with the browser's
@@ -387,7 +391,7 @@ module.exports.deskaudio = function (parent) {
                 sess.ws.on('close', function () { removeSession(sess); });
             }
             ensureKeepalive();
-            logEvent(sess, node, 'Прослушивание звука рабочего стола: начало');
+            logEvent(sess, node, 'Desktop audio listening started');
             var consent = consentInfo(consentFlags(web, domain, node, sess.user), domain, sess.user);
 
             if (st && st.codec === 'opus' && Array.isArray(command.codecs) && command.codecs.indexOf('opus') < 0)

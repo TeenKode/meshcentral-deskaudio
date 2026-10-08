@@ -32,7 +32,7 @@ var watchdog = null;
 // Plugin version of this agent code (= config.json "version"; a test keeps them
 // equal). Shown in the browser log so an outdated agent core is obvious: the
 // core is rebuilt only when the MeshCentral server restarts.
-var VERSION = '1.1.3';
+var VERSION = '1.1.4';
 var PROTO = 3;            // 2 = understands sid and consent; 3 = fetches the helper on demand
 var pendingWin = null;    // start args waiting for the helper bytes ('need' sent)
 
@@ -425,7 +425,7 @@ function startCapture(a) {
     pending = askConsent(c, function (ok) {
         pending = null;
         if (curSid !== sid) return;                 // stopped or restarted meanwhile
-        if (!ok) return send({ pluginaction: 'status', sid: sid, state: 'error', code: 'consent_denied', msg: 'Пользователь не разрешил прослушивание' });
+        if (!ok) return send({ pluginaction: 'status', sid: sid, state: 'error', code: 'consent_denied', msg: 'the local user denied listening' });
         lastKeep = Date.now();
         begin(a);
         if (c.notify) notifyUser(c);

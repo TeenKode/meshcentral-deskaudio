@@ -64,7 +64,8 @@ connection is steady. The learned size is remembered per device for a day.
 * Listening requires the **Remote Control** right on the device. Users restricted with **No Desktop** cannot
   listen.
 * If the device group or user requires **desktop consent**, the remote user is asked to allow listening
-  first. With **desktop notification**, the remote user is told who is listening.
+  first. With **desktop notification** or the **connection toolbar**, the remote user gets a notification
+  telling who is listening (the toolbar itself belongs to the desktop session; audio has no toolbar of its own).
 * Every start and stop (with duration) is recorded in the device's event log.
 
 Use the plugin in line with your organisation's policies and applicable law.
