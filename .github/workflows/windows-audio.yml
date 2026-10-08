@@ -1,0 +1,105 @@
+name: Windows audio capture
+
+# Real WASAPI loopback capture with the shipped helpers on a Windows runner.
+# The runner has no sound card, so a virtual one (VB-CABLE) is installed; a
+# test tone (440 Hz + 1000 Hz) is played to the default output and captured in
+# PCM / ADPCM / Opus, x64 and x86. Opus is decoded with libopus on Linux.
+# Runs when the helpers or these checks change, or by hand.
+on:
+  push:
+    paths:
+      - "helpers/**"
+      - "modules_meshcore/**"
+      - "e2e/**"
+      - ".github/workflows/windows-audio.yml"
+  pull_request:
+    paths:
+      - "helpers/**"
+      - "modules_meshcore/**"
+      - "e2e/**"
+      - ".github/workflows/windows-audio.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install a virtual sound card (VB-CABLE)
+        uses: LABSN/sound-ci-helpers@e9d6ba52163a3283714a68412036ddf33f78d49c
+      - name: Start the Windows audio service
+        shell: pwsh
+        run: |
+          foreach ($s in "AudioEndpointBuilder", "Audiosrv") {
+            Set-Service -Name $s -StartupType Automatic
+            Start-Service -Name $s
+          }
+          Get-Service AudioEndpointBuilder, Audiosrv | Format-Table -AutoSize
+          Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | Format-Table -AutoSize
+      - name: Capture the test tone with the real helpers
+        run: node e2e/win-capture.js capture-out
+      # The real Windows MeshAgent (from the pinned MeshCentral npm package) runs
+      # the plugin's agent code: helper download on demand, hash check, drop
+      # into the agent folder, start through MeshAgent's child_process, real
+      # WASAPI audio from the tone; then reuse of the local copy, and refusal
+      # of a corrupted download.
+      - name: Get the Windows MeshAgent (MeshCentral 1.2.5)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\ma" | Out-Null
+          Set-Location "$env:RUNNER_TEMP"
+          npm pack meshcentral@1.2.5 --silent
+          tar -xzf meshcentral-1.2.5.tgz package/agents/MeshService64.exe
+          $h = (Get-FileHash package/agents/MeshService64.exe -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne "cbf10a37fc01f74f2473aeca0a4b391dca6f9d0a8d0300aa7181dbce7bacc51e") { throw "unexpected MeshService64.exe hash $h" }
+          Copy-Item package/agents/MeshService64.exe "$env:RUNNER_TEMP\ma\MeshService64.exe"
+      - name: Plugin agent code inside the real Windows MeshAgent
+        shell: pwsh
+        run: |
+          $env:EXPECT_AUDIO = "1"
+          node e2e/agent-duktape-expect.js > expect.json
+          $wav = (Resolve-Path capture-out/tone.wav).Path
+          $player = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList "-NoProfile", "-Command", "`$p = New-Object System.Media.SoundPlayer '$wav'; `$p.PlayLooping(); Start-Sleep -Seconds 300"
+          Start-Sleep -Seconds 2
+          $env:DESKAUDIO_ROOT = $env:GITHUB_WORKSPACE
+          $out = & "$env:RUNNER_TEMP\ma\MeshService64.exe" "$env:GITHUB_WORKSPACE\e2e\agent-windows.js" 2>&1 | Out-String
+          Stop-Process -Id $player.Id -Force -ErrorAction SilentlyContinue
+          Write-Output $out
+          if ($out -notmatch "ALL OK") { throw "agent test failed" }
+      - name: Keep the Opus captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-opus-captures
+          path: capture-out/capture-opus-*.bin
+          if-no-files-found: warn
+
+  # The Opus streams captured on Windows, decoded with libopus and checked for
+  # the tone the same way as PCM/ADPCM.
+  opus-content:
+    needs: capture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install libopus
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-opus-captures
+          path: cap
+      - name: Decode and check
+        run: |
+          cc -O2 -Wall -o /tmp/opus-decode e2e/opus-decode.c -lopus
+          for f in cap/capture-opus-*.bin; do
+            /tmp/opus-decode "$f" > "$f.raw"
+            node e2e/check-pcm.js "$f.raw" 48000 "$(basename "$f" .bin)"
+          done

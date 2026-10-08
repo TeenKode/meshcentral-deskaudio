@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The agent tests are split by platform: the Linux suite exercises the
+  # sh -c capture path, the Windows suite the helper-drop and framed-stdout
+  # path. Each runs on its own runner; each suite skips itself elsewhere.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm test
+
+  # Rebuild the native Windows helpers from source and make sure the committed
+  # binaries are exactly what the source produces (the build is reproducible on
+  # a pinned toolchain). libopus (pinned tarball, hash-checked) is downloaded
+  # and built statically first: the helper links it and gains Opus encoding.
+  native:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64 and cmake
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq g++-mingw-w64-x86-64 g++-mingw-w64-i686 cmake
+      - name: Build static libopus (MinGW)
+        run: sh helpers/build-opus.sh
+      - name: Build helpers
+        run: sh helpers/build-native.sh
+      # Uploaded before the match check, so the binaries can be fetched and
+      # committed when the source legitimately changes (this runner has the
+      # exact pinned toolchain).
+      - name: Upload rebuilt helpers
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebuilt-helpers
+          path: |
+            helpers/deskaudio-x64.exe
+            helpers/deskaudio-x86.exe
+          if-no-files-found: error
+      - name: Committed helpers match the source
+        run: |
+          if ! git diff --quiet -- helpers/deskaudio-x64.exe helpers/deskaudio-x86.exe; then
+            echo "::error::helpers/*.exe differ from win-loopback-native.cpp — run helpers/build-native.sh on Ubuntu 24.04 and commit the result"
+            exit 1
+          fi
+
+  # Smoke test for the Opus encoder wrapper against the system libopus:
+  # catches frame-size regressions (invalid opus_encode() sizes fail silently
+  # in the helper otherwise).
+  opus-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system libopus
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev
+      - name: Build and run
+        run: |
+          cc -O2 -Wall -o /tmp/opus-test helpers/opus-test.c -lopus -lm
+          /tmp/opus-test
+
+  # Real-browser playback check: Chromium decodes Opus with WebCodecs and plays
+  # it through the AudioWorklet; the recorded output must have no gaps.
+  browser-e2e:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install libopus and Playwright Chromium
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev
+          npm install --no-save playwright@1.56.1
+          npx playwright install --with-deps chromium
+      - name: Opus playback has no gaps
+        run: |
+          cc -O2 -o /tmp/opus-packets e2e/opus-packets.c -lopus -lm
+          /tmp/opus-packets > /tmp/packets.bin
+          node e2e/opus-playback.js /tmp/packets.bin opus2
+          node e2e/opus-playback.js /tmp/packets.bin opus
+      - name: Two computers, one account, one device (clean and stalling network)
+        run: |
+          /tmp/opus-packets 20 1000 > /tmp/packets20.bin
+          node e2e/multi-listener.js /tmp/packets20.bin clean
+          node e2e/multi-listener.js /tmp/packets20.bin stalls
+
+  # The agent module inside the real MeshAgent (Duktape, its own Buffer, fs,
+  # crypto, child_process) instead of Node: results must match Node's, and a
+  # real capture runs through MeshAgent's child_process. The agent binary comes
+  # from the pinned MeshCentral npm package (checked by SHA-256). MeshAgent
+  # differs from Node in ways that broke the plugin before: hex is UPPER-case,
+  # Buffer.from(<Buffer>) is empty, unreferenced timers are collected. The
+  # Windows MeshAgent runs the helper-delivery flow in windows-audio.yml.
+  agent-duktape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Get MeshAgent (Linux x64) from MeshCentral 1.2.5
+        run: |
+          cd /tmp && npm pack meshcentral@1.2.5 --silent
+          tar xzf meshcentral-1.2.5.tgz package/agents/meshagent_x86-64
+          echo "891da8d32d0fbfec933b7ca5aa64b27650c05531a772f993601f20ae7c2c0a3b  package/agents/meshagent_x86-64" | sha256sum -c -
+          install -m 755 package/agents/meshagent_x86-64 /tmp/meshagent
+      - name: Agent module in MeshAgent matches Node
+        run: |
+          node e2e/agent-duktape-expect.js > expect.json
+          timeout 60 /tmp/meshagent e2e/agent-duktape.js | tee /tmp/duktape.log
+          grep -q "^ALL OK" /tmp/duktape.log
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck helpers/*.sh
+
+  # Byte-exactness of the native ADPCM encoder vs the JS encoder: the C test
+  # (helpers/adpcm-test.c, which includes the same adpcm-enc.h the Windows
+  # helper compiles) prints one hex line per 40 ms block; it must equal the
+  # committed fixture, which the Node suite separately verifies against the
+  # JS encoder. Both sides therefore provably produce identical bytes.
+  adpcm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native encoder matches the fixture
+        run: |
+          cc -O2 -Wall -o /tmp/adpcm-test helpers/adpcm-test.c -lm
+          /tmp/adpcm-test > /tmp/adpcm-actual.hex
+          if ! diff -u test/fixtures/native-adpcm.hex /tmp/adpcm-actual.hex; then
+            echo "::error::helpers/adpcm-enc.h output differs from the JS encoder fixture — the C port is no longer byte-exact"
+            exit 1
+          fi
+
+  # The resampler quality gate: build the host test with g++ and run it. Checks
+  # passband fidelity and anti-alias suppression for 48k and 44.1k -> 16k,
+  # and that streaming in odd-sized pieces matches one-shot resampling.
+  resampler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the resampler test
+        run: |
+          cc -O2 -Wall -o /tmp/resample-test helpers/resample-test.c -lm
+          /tmp/resample-test
