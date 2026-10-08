@@ -32,7 +32,7 @@ var watchdog = null;
 // Plugin version of this agent code (= config.json "version"; a test keeps them
 // equal). Shown in the browser log so an outdated agent core is obvious: the
 // core is rebuilt only when the MeshCentral server restarts.
-var VERSION = '1.1.2';
+var VERSION = '1.1.3';
 var PROTO = 3;            // 2 = understands sid and consent; 3 = fetches the helper on demand
 var pendingWin = null;    // start args waiting for the helper bytes ('need' sent)
 

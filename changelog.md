@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.3
+
+* Тексты запроса согласия и уведомления на удалённом компьютере по умолчанию теперь на английском:
+  «User {0} wants to listen to this computer's audio. Allow?» и «User {0} is listening to this computer's audio.»
+  Свои тексты по-прежнему задаются в `consentMessage` и `notifyMessage`.
+
 ## 1.1.2
 
 По журналам с реальной установки.

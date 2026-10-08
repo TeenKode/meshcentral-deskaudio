@@ -49,8 +49,8 @@ module.exports.deskaudio = function (parent) {
         return (isNaN(v) || v < min || v > max) ? def : v;
     }
     var KEEPALIVE_MS = 15000;
-    var DEFAULT_CONSENT_MSG = 'Пользователь {0} запрашивает прослушивание звука этого компьютера. Разрешить?';
-    var DEFAULT_NOTIFY_MSG = 'Пользователь {0} слушает звук этого компьютера.';
+    var DEFAULT_CONSENT_MSG = "User {0} wants to listen to this computer's audio. Allow?";
+    var DEFAULT_NOTIFY_MSG = "User {0} is listening to this computer's audio.";
 
     // nodeid -> stream: { sid, listeners: [sess], users: {userid: true}, pending: {reqid: sess},
     //                     consent, ready, rate }

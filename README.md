@@ -93,8 +93,8 @@ In `meshcentral-data/config.json`. Changes apply to the next listening session, 
 | `maxListenersPerNode` | listeners per device (1–100) | 10 |
 | `maxStreams` | simultaneous audio streams on the server | 50 |
 | `spawnAsUser` | Windows: run the capture helper in the logged-in user's session | `false` |
-| `consentMessage` | consent prompt on the remote computer, `{0}` = user name | Russian text |
-| `notifyMessage` | notification on the remote computer, `{0}` = user name | Russian text |
+| `consentMessage` | consent prompt on the remote computer, `{0}` = user name | text above |
+| `notifyMessage` | notification on the remote computer, `{0}` = user name | text above |
 
 ## Troubleshooting
 

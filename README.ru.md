@@ -82,8 +82,8 @@
       "maxListenersPerNode": 10,
       "maxStreams": 50,
       "spawnAsUser": false,
-      "consentMessage": "Пользователь {0} запрашивает прослушивание звука этого компьютера. Разрешить?",
-      "notifyMessage": "Пользователь {0} слушает звук этого компьютера."
+      "consentMessage": "User {0} wants to listen to this computer's audio. Allow?",
+      "notifyMessage": "User {0} is listening to this computer's audio."
     }
   }
 }
@@ -94,8 +94,8 @@
 | `maxListenersPerNode` | слушателей на одно устройство (1–100) | 10 |
 | `maxStreams` | одновременных аудиопотоков на сервере | 50 |
 | `spawnAsUser` | Windows: запускать хелпер в сессии вошедшего пользователя | `false` |
-| `consentMessage` | вопрос о согласии на удалённом компьютере, `{0}` — имя пользователя | текст выше |
-| `notifyMessage` | уведомление на удалённом компьютере, `{0}` — имя пользователя | текст выше |
+| `consentMessage` | вопрос о согласии на удалённом компьютере, `{0}` — имя пользователя | английский текст выше |
+| `notifyMessage` | уведомление на удалённом компьютере, `{0}` — имя пользователя | английский текст выше |
 
 ## Если что-то не так
 
