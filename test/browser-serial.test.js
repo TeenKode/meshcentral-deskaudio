@@ -111,7 +111,7 @@ test("serialized exports survive a full click-to-audio cycle", () => {
 
     // 3) onStatus(started)
     ctxObj.onStatus({ nodeid: "node//pc1", state: "started", rate: 16000, codec: "adpcm" });
-    assert.strictEqual(ctxObj._s.statusText.indexOf("Идёт передача") === 0, true, "status text shown");
+    assert.strictEqual(ctxObj._s.statusText.indexOf("Receiving audio") === 0, true, "status text shown (no page language: English)");
 
     // 4) onChunk (ADPCM path) - must reach the worklet/scheduler without closures
     const pcm = Buffer.alloc(64);

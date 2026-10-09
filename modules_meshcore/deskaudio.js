@@ -32,7 +32,7 @@ var watchdog = null;
 // Plugin version of this agent code (= config.json "version"; a test keeps them
 // equal). Shown in the browser log so an outdated agent core is obvious: the
 // core is rebuilt only when the MeshCentral server restarts.
-var VERSION = '1.1.4';
+var VERSION = '1.1.5';
 var PROTO = 3;            // 2 = understands sid and consent; 3 = fetches the helper on demand
 var pendingWin = null;    // start args waiting for the helper bytes ('need' sent)
 
@@ -394,7 +394,54 @@ function askConsent(c, cb) {
 }
 
 function notifyUser(c) {
+    if (c.toast === false) return;       // from 1.1.5 the server says whether a toast is wanted
     try { require('toaster').Toast(c.title || 'MeshCentral', c.notifyMsg); } catch (e) { }
+}
+
+// The listening bar (consent flag "connection toolbar"): MeshAgent's own
+// notifybar-desktop, the module the desktop's privacy bar uses. It lists who
+// is listening; closing it stops the capture for everyone. The server sends
+// the text again whenever the listeners change.
+var bar = null, barShown = '';
+var BAR_COLORS = {
+    background: (global._MSH != null) ? global._MSH().background : '0,54,105',
+    foreground: (global._MSH != null) ? global._MSH().foreground : '255,255,255'
+};
+// notifybar-desktop pastes the text into a script between single quotes: keep
+// it to plain characters, so a user name can't break out of the string.
+function barSafe(t) {
+    return String(t).replace(/'/g, '\u2019').replace(/[\\\u0000-\u001f\u007f\u2028\u2029]/g, ' ').substring(0, 200);
+}
+function showBar(text) {
+    text = text ? barSafe(text) : '';
+    if (text === barShown && (bar || !text)) return;
+    closeBar();
+    if (!text) return;
+    var tsid;
+    try { tsid = require('user-sessions').consoleUid(); } catch (e) { }
+    try {
+        var nb = require('notifybar-desktop');
+        bar = nb(text, tsid, BAR_COLORS);
+    } catch (e) {
+        bar = null;
+        log('listening bar not available: ' + e);
+        return;
+    }
+    barShown = text;
+    var sid = curSid;
+    bar.on('close', function () {
+        bar = null; barShown = '';
+        if (curSid !== sid) return;
+        send({ pluginaction: 'status', sid: sid, state: 'stopped', code: 'bar_closed', msg: 'The remote user closed the listening bar' });
+        stopCapture(true);
+    });
+}
+function closeBar() {
+    var b = bar;
+    bar = null; barShown = '';
+    if (!b) return;
+    try { b.removeAllListeners('close'); } catch (e) { }
+    try { b.close(); } catch (e) { }
 }
 
 function begin(a) {
@@ -418,6 +465,7 @@ function startCapture(a) {
     if (!c.prompt) {
         begin(a);
         if (c.notify) notifyUser(c);
+        if (c.bar) showBar(c.barText);
         return;
     }
     var sid = curSid;
@@ -425,15 +473,17 @@ function startCapture(a) {
     pending = askConsent(c, function (ok) {
         pending = null;
         if (curSid !== sid) return;                 // stopped or restarted meanwhile
-        if (!ok) return send({ pluginaction: 'status', sid: sid, state: 'error', code: 'consent_denied', msg: 'the local user denied listening' });
+        if (!ok) return send({ pluginaction: 'status', sid: sid, state: 'error', code: 'consent_denied', msg: 'The user did not allow listening' });
         lastKeep = Date.now();
         begin(a);
         if (c.notify) notifyUser(c);
+        if (c.bar) showBar(c.barText);
     });
 }
 
 function stopCapture(silent) {
     stopWatch();
+    closeBar();
     pendingWin = null;
     if (pending) { try { if (pending.close) pending.close(); } catch (e) { } pending = null; }
     var c = child, sid = curSid;
@@ -468,8 +518,9 @@ function consoleaction(args, rights, sessionid, parent) {
             });
             break;
         case 'notify': if (forCurrent(args) && args.consent) notifyUser(args.consent); break;
+        case 'bar': if (forCurrent(args) && curSid !== null) showBar(args.text); break;
         case 'helper': onHelper(args); break;
     }
 }
 
-module.exports = { _version: VERSION, _sha384: sha384, _sameSha: sameSha, _localHelper: localHelper, consoleaction: consoleaction, _isSilent: isSilent, _adpcmEncode: adpcmEncode, _dropFile: dropFile };
+module.exports = { _version: VERSION, _sha384: sha384, _sameSha: sameSha, _localHelper: localHelper, consoleaction: consoleaction, _isSilent: isSilent, _adpcmEncode: adpcmEncode, _dropFile: dropFile, _showBar: showBar, _barSafe: barSafe };

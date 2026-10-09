@@ -85,7 +85,7 @@ test("start is rejected when the device is offline", () => {
     userStart(obj, sess, makeWeb());
     const st = lastStatus(sess.ws);
     assert.ok(st && st.state === "error");
-    assert.match(st.msg, /не в сети/i);
+    assert.match(st.msg, /offline/i);
 });
 
 test("start is ignored for a non-node id", () => {
@@ -134,7 +134,7 @@ test("listeners beyond the cap are rejected", () => {
     userStart(obj, overflow, web);
     const st = lastStatus(overflow.ws);
     assert.ok(st && st.state === "error");
-    assert.match(st.msg, /слишком много/i);
+    assert.match(st.msg, /too many/i);
 });
 
 test("agent audio chunks are relayed to every listener", () => {
@@ -259,7 +259,7 @@ test("keepalive ends the stream when the agent has disconnected", () => {
 
         const st = lastStatus(sess.ws);
         assert.strictEqual(st.state, "stopped");
-        assert.match(st.msg, /отключил/i);
+        assert.match(st.msg, /disconnected/i);
     } finally {
         global.setInterval = realSet;
         global.clearInterval = realClear;
@@ -312,7 +312,7 @@ test("a new stream beyond the server-wide cap is rejected", () => {
     obj.serveraction({ pluginaction: "start", nodeid: nid, rate: 16000 }, over, web);
     const st = lastStatus(over.ws);
     assert.ok(st && st.state === "error");
-    assert.match(st.msg, /слишком много одновременных/i);
+    assert.match(st.msg, /too many simultaneous/i);
 });
 
 // ---------- session ids, races, rights, consent ----------
@@ -467,6 +467,120 @@ test("the connection-toolbar flag notifies the remote user, without a prompt", (
     assert.strictEqual(c.notify, true, "notified at the start");
     userStart(obj, makeUserSession({ userid: "user//b" }), web);
     assert.strictEqual(agent.sent.filter((m) => m.pluginaction === "notify").length, 1, "a further listener is notified too");
+});
+
+function barMsgs(agent) { return agent.sent.filter((m) => m.pluginaction === "bar"); }
+
+test("the connection-toolbar flag asks the agent for a listening bar listing the listeners", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const web = consentWeb(64);
+    const a = makeUserSession({ userid: "user//a", name: "alice" });
+    const b = makeUserSession({ userid: "user//b", name: "bob" });
+    userStart(obj, a, web);
+    const c = agentStarts(agent)[0].consent;
+    assert.strictEqual(c.bar, true);
+    assert.strictEqual(c.toast, false, "no toast: the bar replaces it");
+    assert.strictEqual(c.notify, true, "older agent cores still get a toast");
+    assert.strictEqual(c.barText, "Desktop audio is being listened to by: alice");
+
+    userStart(obj, b, web);
+    assert.strictEqual(barMsgs(agent).pop().text, "Desktop audio is being listened to by: alice, bob", "a joining listener is added");
+    userStop(obj, a, web);
+    assert.strictEqual(barMsgs(agent).pop().text, "Desktop audio is being listened to by: bob", "a leaving one is removed");
+});
+
+test("the browser adds the open desktop session's consent options (Connect menu)", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    userStart(obj, makeUserSession({ name: "alice" }), makeWeb(), { consent: 64 });
+    const c = agentStarts(agent)[0].consent;
+    assert.strictEqual(c.bar, true, "\"Privacy Bar\" connection: a listening bar");
+    assert.strictEqual(c.prompt, false);
+    assert.match(c.barText, /alice/);
+
+    const r = loadPlugin();
+    const agent2 = connectAgent(r.meshServer, NODE);
+    userStart(r.obj, makeUserSession(), makeWeb(), { consent: 8 + 64 });
+    const c2 = agentStarts(agent2)[0].consent;
+    assert.strictEqual(c2.prompt, true, "\"Ask Consent + Bar\": the user is asked");
+    assert.strictEqual(c2.bar, true);
+});
+
+test("the browser can only add consent flags, never remove or invent others", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    userStart(obj, makeUserSession(), consentWeb(8), { consent: 0 });
+    const c = agentStarts(agent)[0].consent;
+    assert.strictEqual(c.prompt, true, "the device group's prompt stays");
+
+    const r = loadPlugin();
+    const agent2 = connectAgent(r.meshServer, NODE);
+    userStart(r.obj, makeUserSession(), makeWeb(), { consent: 0xFFFF & ~(1 | 8 | 64) });
+    const c2 = agentStarts(agent2)[0].consent;
+    assert.deepStrictEqual([c2.prompt, c2.toast, c2.bar], [false, false, false], "other bits are ignored");
+});
+
+test("a listener who needs the bar turns it on for a running stream; after consent too", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const a = makeUserSession({ userid: "user//a", name: "alice" });
+    const b = makeUserSession({ userid: "user//b", name: "bob" });
+    userStart(obj, a, makeWeb());
+    const sid = agentStarts(agent)[0].sid;
+    agentMsg(obj, agent, { pluginaction: "status", sid, state: "started", proto: 3, rate: 16000 });
+    assert.strictEqual(barMsgs(agent).length, 0, "no bar without the flag");
+
+    userStart(obj, b, makeWeb(), { consent: 8 + 64 });
+    const ask = agent.sent.find((m) => m.pluginaction === "consent");
+    assert.ok(ask, "bob's listening is asked for");
+    assert.strictEqual(barMsgs(agent).length, 0, "no bar before the answer");
+    agentMsg(obj, agent, { pluginaction: "consentresult", sid, reqid: ask.reqid, ok: true });
+    assert.strictEqual(barMsgs(agent).pop().text, "Desktop audio is being listened to by: alice, bob");
+});
+
+test("a live settings change keeps the bar", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const sess = makeUserSession({ name: "alice" });
+    userStart(obj, sess, consentWeb(64), { codecs: ["adpcm", "pcm"] });
+    const sid1 = agentStarts(agent)[0].sid;
+    agentMsg(obj, agent, { pluginaction: "status", sid: sid1, state: "started", proto: 3, rate: 16000 });
+    obj.serveraction({ pluginaction: "reconfigure", nodeid: NODE, codecs: ["adpcm", "pcm"], rate: 24000 }, sess, consentWeb(64));
+    const c = agentStarts(agent)[1].consent;
+    assert.strictEqual(c.bar, true);
+    assert.strictEqual(c.prompt, false);
+    assert.strictEqual(c.toast, false, "no second toast");
+    assert.match(c.barText, /alice/);
+});
+
+test("closing the bar on the remote computer ends the stream for every listener", () => {
+    const { obj, meshServer } = loadPlugin();
+    const agent = connectAgent(meshServer, NODE);
+    const a = makeUserSession({ userid: "user//a" });
+    const b = makeUserSession({ userid: "user//b" });
+    const web = consentWeb(64);
+    userStart(obj, a, web);
+    userStart(obj, b, web);
+    const sid = agentStarts(agent)[0].sid;
+    agentMsg(obj, agent, { pluginaction: "status", sid, state: "stopped", code: "bar_closed", msg: "The remote user closed the listening bar" });
+    assert.strictEqual(lastStatus(a.ws).code, "bar_closed");
+    assert.strictEqual(lastStatus(b.ws).code, "bar_closed");
+    assert.ok(meshServer.events.some((e) => /ended.*closed the listening bar/.test(e.msg)), "logged with the reason");
+});
+
+test("the bar text can be set in config.json", () => {
+    const { obj, meshServer } = loadPlugin();
+    withSettings(meshServer, { barmessage: "Listening: {0}" });
+    const agent = connectAgent(meshServer, NODE);
+    userStart(obj, makeUserSession({ name: "alice" }), consentWeb(64));
+    assert.strictEqual(agentStarts(agent)[0].consent.barText, "Listening: alice");
+});
+
+test("server statuses are sent in English", () => {
+    const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "deskaudio.js"), "utf8");
+    const server = src.slice(0, src.indexOf("Everything below runs in the BROWSER"));
+    assert.doesNotMatch(server, /[А-Яа-яЁё]/, "no Russian text in the server part");
 });
 
 test("chunks with an invalid rate are dropped", () => {

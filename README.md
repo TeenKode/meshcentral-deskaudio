@@ -64,8 +64,11 @@ connection is steady. The learned size is remembered per device for a day.
 * Listening requires the **Remote Control** right on the device. Users restricted with **No Desktop** cannot
   listen.
 * If the device group or user requires **desktop consent**, the remote user is asked to allow listening
-  first. With **desktop notification** or the **connection toolbar**, the remote user gets a notification
-  telling who is listening (the toolbar itself belongs to the desktop session; audio has no toolbar of its own).
+  first. With **desktop notification**, the remote user gets a notification telling who is listening.
+* With the **connection toolbar** flag, a bar on the remote screen shows who is listening for as long as
+  audio is on. Closing the bar stops listening for everyone.
+* Options of the open desktop session count too: after connecting with **Ask Consent**, **Privacy Bar** or
+  **Ask Consent + Bar** from the Connect menu, turning audio on asks or shows the bar the same way.
 * Every start and stop (with duration) is recorded in the device's event log.
 
 Use the plugin in line with your organisation's policies and applicable law.
@@ -83,7 +86,8 @@ In `meshcentral-data/config.json`. Changes apply to the next listening session, 
       "maxStreams": 50,
       "spawnAsUser": false,
       "consentMessage": "User {0} wants to listen to this computer's audio. Allow?",
-      "notifyMessage": "User {0} is listening to this computer's audio."
+      "notifyMessage": "User {0} is listening to this computer's audio.",
+      "barMessage": "Desktop audio is being listened to by: {0}"
     }
   }
 }
@@ -96,6 +100,7 @@ In `meshcentral-data/config.json`. Changes apply to the next listening session, 
 | `spawnAsUser` | Windows: run the capture helper in the logged-in user's session | `false` |
 | `consentMessage` | consent prompt on the remote computer, `{0}` = user name | text above |
 | `notifyMessage` | notification on the remote computer, `{0}` = user name | text above |
+| `barMessage` | listening bar on the remote computer, `{0}` = who is listening | text above |
 
 ## Troubleshooting
 

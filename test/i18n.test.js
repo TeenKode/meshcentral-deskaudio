@@ -26,6 +26,23 @@ test("an English MeshCentral page gets an English interface", () => {
     });
 });
 
+test("only a Russian page gets Russian: Ukrainian, Belarusian and others get English", () => {
+    for (const lang of ["uk", "be-BY", "de", "fr-FR"]) withLang(lang, (obj) => {
+        assert.strictEqual(obj._t("tab"), "Audio", lang);
+    });
+});
+
+test("a server status already in English is not repeated after its translation", () => {
+    withLang("ru", (obj) => {
+        assert.strictEqual(obj._statusText({ code: "offline", msg: "The device is offline" }), "Устройство не в сети");
+        assert.strictEqual(obj._statusText({ code: "bar_closed", msg: "The remote user closed the listening bar" }),
+            "Удалённый пользователь закрыл панель прослушивания");
+    });
+    withLang("en", (obj) => {
+        assert.strictEqual(obj._statusText({ code: "offline", msg: "The device is offline" }), "The device is offline");
+    });
+});
+
 test("a Russian page gets Russian; unknown codes fall back to the sent text", () => {
     withLang("ru-RU", (obj) => {
         assert.strictEqual(obj._t("tab"), "Звук");

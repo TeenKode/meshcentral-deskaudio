@@ -14,7 +14,7 @@ module.exports.deskaudio = function (parent) {
     var obj = {};
     obj.parent = parent;
     obj.meshServer = parent.parent;
-    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setRate', 'setCodec', 'setBitrate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_playerCore', 'probeCodecs', '_params', '_apply', '_ensureCtx', '_workletCode', '_onPlayerStats', '_learned', '_learn', '_ensureOpusDecoder', '_pushDecoded', '_opusChunk', '_teardown', 'log', 'onLog', 'copyLog', 'clearLog', 'toggleLog', '_stats', '_t', '_statusText'];
+    obj.exports = ['onDeviceRefreshEnd', 'render', 'toggle', 'start', 'stop', 'setVolume', 'setAuto', 'setRate', 'setCodec', 'setBitrate', 'setSilence', 'setBuffer', 'onChunk', 'onStatus', 'onDesktopDisconnect', '_adpcmDecode', '_playerCore', 'probeCodecs', '_params', '_deskConsent', '_apply', '_ensureCtx', '_workletCode', '_onPlayerStats', '_learned', '_learn', '_ensureOpusDecoder', '_pushDecoded', '_opusChunk', '_teardown', 'log', 'onLog', 'copyLog', 'clearLog', 'toggleLog', '_stats', '_t', '_statusText'];
 
     var fs = require('fs');
     var path = require('path');
@@ -33,7 +33,8 @@ module.exports.deskaudio = function (parent) {
     // Optional settings in MeshCentral's config.json:
     //   "settings": { "plugins": { "enabled": true,
     //     "deskaudio": { "maxListenersPerNode": 10, "maxStreams": 50, "spawnAsUser": false,
-    //                    "consentMessage": "...{0}...", "notifyMessage": "...{0}..." } } }
+    //                    "consentMessage": "...{0}...", "notifyMessage": "...{0}...",
+    //                    "barMessage": "...{0}..." } } }
     // MeshCentral lower-cases config keys on load, so keys are matched
     // case-insensitively. Read on every use: no restart needed after a reload.
     function settings() {
@@ -52,6 +53,11 @@ module.exports.deskaudio = function (parent) {
     var KEEPALIVE_MS = 15000;
     var DEFAULT_CONSENT_MSG = "User {0} wants to listen to this computer's audio. Allow?";
     var DEFAULT_NOTIFY_MSG = "User {0} is listening to this computer's audio.";
+    var DEFAULT_BAR_MSG = 'Desktop audio is being listened to by: {0}';
+    // Consent bits a browser may add for its own request: the options the open
+    // desktop session was started with (MeshCentral's Connect menu). They are
+    // only ever added to the stored flags, never replace them.
+    var CONSENT_MASK = USERCONSENT_DesktopNotifyUser | USERCONSENT_DesktopPromptUser | USERCONSENT_ShowConnectionToolbar;
 
     // nodeid -> stream: { sid, listeners: [sess], users: {userid: true}, pending: {reqid: sess},
     //                     consent, ready, rate }
@@ -220,7 +226,7 @@ module.exports.deskaudio = function (parent) {
             if (ids.length === 0) { clearInterval(keepTimer); keepTimer = null; return; }
             ids.forEach(function (nodeid) {
                 var agent = agentOf(nodeid);
-                if (!agent) { endStream(nodeid, 'stopped', 'agent_offline', 'Агент отключился'); return; }
+                if (!agent) { endStream(nodeid, 'stopped', 'agent_offline', 'The agent disconnected'); return; }
                 sendAgent(agent, { pluginaction: 'keepalive', sid: streams[nodeid].sid });
             });
         }, KEEPALIVE_MS);
@@ -240,8 +246,8 @@ module.exports.deskaudio = function (parent) {
         if (!st) return;
         logEnd(st, sess);
         st.listeners = st.listeners.filter(function (s) { return s !== sess; });
-        Object.keys(st.pending).forEach(function (r) { if (st.pending[r] === sess) delete st.pending[r]; });
-        if (st.listeners.length > 0 || Object.keys(st.pending).length > 0) return;
+        Object.keys(st.pending).forEach(function (r) { if (st.pending[r] === sess) { delete st.pending[r]; delete st.pendingBar[r]; } });
+        if (st.listeners.length > 0 || Object.keys(st.pending).length > 0) { updateBar(st); return; }
         delete streams[nodeid];
         var agent = agentOf(nodeid);
         if (agent) sendAgent(agent, { pluginaction: 'stop', sid: st.sid });
@@ -252,15 +258,16 @@ module.exports.deskaudio = function (parent) {
     }
 
     // Effective user-consent flags for the desktop, combined exactly like
-    // MeshCentral's relay does: server-wide | device group | device | user.
-    function consentFlags(web, domain, node, user) {
-        var c = 0;
+    // MeshCentral's relay does: server-wide | device group | device | user,
+    // plus `extra`, the flags of the browser's open desktop session.
+    function consentFlags(web, domain, node, user, extra) {
+        var c = (typeof extra === 'number') ? extra : 0;
         if (domain && typeof domain.userconsentflags === 'number') c |= domain.userconsentflags;
         var mesh = (web && web.meshes) ? web.meshes[node.meshid] : null;
         if (mesh && typeof mesh.consent === 'number') c |= mesh.consent;
         if (typeof node.consent === 'number') c |= node.consent;
         if (user && typeof user.consent === 'number') c |= user.consent;
-        return c & (USERCONSENT_DesktopNotifyUser | USERCONSENT_DesktopPromptUser | USERCONSENT_ShowConnectionToolbar);
+        return c & CONSENT_MASK;
     }
 
     // What the agent needs to ask (or notify) the local user for one listener.
@@ -270,18 +277,41 @@ module.exports.deskaudio = function (parent) {
         var cfg = settings();
         var cmsg = (typeof cfg.consentmessage === 'string' && cfg.consentmessage) ? cfg.consentmessage : DEFAULT_CONSENT_MSG;
         var nmsg = (typeof cfg.notifymessage === 'string' && cfg.notifymessage) ? cfg.notifymessage : DEFAULT_NOTIFY_MSG;
+        var toast = (flags & USERCONSENT_DesktopNotifyUser) !== 0;
+        var bar = (flags & USERCONSENT_ShowConnectionToolbar) !== 0;
         return {
             prompt: (flags & USERCONSENT_DesktopPromptUser) !== 0,
-            // The desktop's connection toolbar has no counterpart for audio (it
-            // belongs to the desktop session), so the remote user gets the
-            // notification instead: listening is never silent where the toolbar is on.
-            notify: (flags & (USERCONSENT_DesktopNotifyUser | USERCONSENT_ShowConnectionToolbar)) !== 0,
+            toast: toast,
+            // The connection toolbar flag: the agent shows its own listening bar.
+            bar: bar,
+            // Agent cores before 1.1.5 know only `notify` (a toast): they show
+            // the toast for the bar flag too, so listening is never silent.
+            notify: toast || bar,
             title: (typeof cm.title === 'string') ? cm.title : 'MeshCentral',
             msg: cmsg.replace(/\{0\}/g, who),
             notifyMsg: nmsg.replace(/\{0\}/g, who),
             timeout: (typeof cm.consenttimeout === 'number' && cm.consenttimeout > 0) ? cm.consenttimeout : 30,
             autoAcceptNoUser: cm.autoacceptifdesktopnouser === true
         };
+    }
+
+    // The listening bar's text: everyone currently listening.
+    function barText(st) {
+        var names = [];
+        st.listeners.forEach(function (s) {
+            var n = s.user.realname || s.user.name;
+            if (names.indexOf(n) < 0) names.push(n);
+        });
+        var cfg = settings();
+        var t = (typeof cfg.barmessage === 'string' && cfg.barmessage) ? cfg.barmessage : DEFAULT_BAR_MSG;
+        return t.replace(/\{0\}/g, names.join(', '));
+    }
+
+    // Show / refresh / remove the bar on the agent after the listeners changed.
+    function updateBar(st) {
+        if (!st.bar) return;
+        var agent = agentOf(st.node._id);
+        if (agent) sendAgent(agent, { pluginaction: 'bar', sid: st.sid, text: st.listeners.length ? barText(st) : '' });
     }
 
     function attach(st, sess) {
@@ -343,15 +373,15 @@ module.exports.deskaudio = function (parent) {
         var st = streams[nodeid];
         if (!st || st.listeners.indexOf(sess) < 0) return;
         if (st.listeners.length > 1 || Object.keys(st.pending).length > 0)
-            return sendStatus(sess, nodeid, 'info', 'shared_stream', 'Звук этого устройства слушают и другие — параметры общего потока не изменены');
+            return sendStatus(sess, nodeid, 'info', 'shared_stream', 'Others are listening to this device too — the shared stream was not changed');
         var agent = agentOf(nodeid);
         if (!agent) return;
         var h;
         try { h = loadHelpers(); } catch (e) { return; }
         st.sid = nextSid++;
         st.consent = false;
-        startAgent(agent, st, command, { prompt: false, notify: false }, h);
-        sendStatus(sess, nodeid, 'info', 'reconfigured', 'Параметры изменены');
+        startAgent(agent, st, command, { prompt: false, notify: false, toast: false, bar: !!st.bar, barText: st.bar ? barText(st) : '' }, h);
+        sendStatus(sess, nodeid, 'info', 'reconfigured', 'Settings applied');
     }
 
     // ---------- user (browser) -> server ----------
@@ -372,19 +402,19 @@ module.exports.deskaudio = function (parent) {
             if (ss.gen[nodeid] !== gen) return;
             if (!node || (rights & MESHRIGHT_REMOTECONTROL) === 0 ||
                 (rights !== 0xFFFFFFFF && (rights & MESHRIGHT_NODESKTOP) !== 0))
-                return sendStatus(sess, nodeid, 'error', 'no_rights', 'Нет права «удалённое управление» (рабочий стол) на это устройство');
+                return sendStatus(sess, nodeid, 'error', 'no_rights', 'No "remote control" (desktop) right on this device');
             var agent = agentOf(nodeid);
-            if (!agent) return sendStatus(sess, nodeid, 'error', 'offline', 'Устройство не в сети');
+            if (!agent) return sendStatus(sess, nodeid, 'error', 'offline', 'The device is offline');
 
             var st = streams[nodeid];
             if (st && (st.listeners.indexOf(sess) >= 0 || Object.keys(st.pending).some(function (r) { return st.pending[r] === sess; }))) return;
             var cfg = settings();
             if (st && st.listeners.length + Object.keys(st.pending).length >= intSetting(cfg.maxlistenerspernode, MAX_LISTENERS_PER_NODE, 1, 100))
-                return sendStatus(sess, nodeid, 'error', 'too_many_listeners', 'Слишком много слушателей');
+                return sendStatus(sess, nodeid, 'error', 'too_many_listeners', 'Too many listeners');
             // Server-wide cap: a brand-new capture counts against the total number
             // of simultaneous streams.
             if (!st && Object.keys(streams).length >= intSetting(cfg.maxstreams, MAX_TOTAL_STREAMS, 1, 10000))
-                return sendStatus(sess, nodeid, 'error', 'too_many_streams', 'Сервер: слишком много одновременных аудиопотоков');
+                return sendStatus(sess, nodeid, 'error', 'too_many_streams', 'Server: too many simultaneous audio streams');
 
             if (!ss.hooked && sess.ws) {
                 ss.hooked = true;
@@ -392,10 +422,11 @@ module.exports.deskaudio = function (parent) {
             }
             ensureKeepalive();
             logEvent(sess, node, 'Desktop audio listening started');
-            var consent = consentInfo(consentFlags(web, domain, node, sess.user), domain, sess.user);
+            var extra = (typeof command.consent === 'number') ? (command.consent & CONSENT_MASK) : 0;
+            var consent = consentInfo(consentFlags(web, domain, node, sess.user, extra), domain, sess.user);
 
             if (st && st.codec === 'opus' && Array.isArray(command.codecs) && command.codecs.indexOf('opus') < 0)
-                return sendStatus(sess, nodeid, 'error', 'codec_mismatch', 'Звук этого устройства уже передаётся в Opus, а этот браузер (или выбранный кодек) его не поддерживает');
+                return sendStatus(sess, nodeid, 'error', 'codec_mismatch', 'This device\'s audio is already streamed as Opus, which this browser (or the chosen codec) does not support');
 
             if (st) {
                 // Joining a running capture. If the device requires consent, the
@@ -403,27 +434,32 @@ module.exports.deskaudio = function (parent) {
                 if (consent.prompt && !st.users[sess.user._id]) {
                     var reqid = nextReq++;
                     st.pending[reqid] = sess;
-                    sendStatus(sess, nodeid, 'waiting', 'consent_wait', 'Ожидание разрешения пользователя…', { timeout: consent.timeout });
+                    st.pendingBar[reqid] = consent.bar;
+                    sendStatus(sess, nodeid, 'waiting', 'consent_wait', 'Waiting for the user\'s permission…', { timeout: consent.timeout });
                     sendAgent(agent, { pluginaction: 'consent', sid: st.sid, reqid: reqid, consent: consent });
                     return;
                 }
                 attach(st, sess);
                 if (consent.notify) sendAgent(agent, { pluginaction: 'notify', sid: st.sid, consent: consent });
+                if (consent.bar) st.bar = true;
+                updateBar(st);
                 return sendStatus(sess, nodeid, 'started', '', '', { rate: st.rate });
             }
 
             var rate = parseInt(command.rate, 10);
             if ([8000, 16000, 24000].indexOf(rate) < 0) rate = 16000;
             var h;
-            try { h = loadHelpers(); } catch (e) { return sendStatus(sess, nodeid, 'error', 'no_helpers', 'Не найдены файлы helpers/ плагина'); }
+            try { h = loadHelpers(); } catch (e) { return sendStatus(sess, nodeid, 'error', 'no_helpers', 'The plugin\'s helpers/ files are missing'); }
             st = streams[nodeid] = {
-                sid: nextSid++, listeners: [], users: {}, pending: {}, since: new Map(),
+                sid: nextSid++, listeners: [], users: {}, pending: {}, pendingBar: {}, since: new Map(),
                 node: { _id: node._id, meshid: node.meshid, domain: node.domain },
                 // With consent required, no audio is relayed until the agent
                 // confirms (in 'started') that it understood the consent request.
-                consent: consent.prompt || consent.notify, ready: false, rate: rate
+                consent: consent.prompt || consent.notify, ready: false, rate: rate,
+                bar: consent.bar    // a listening bar is shown while the stream runs
             };
             attach(st, sess);
+            consent.barText = st.bar ? barText(st) : '';
             startAgent(agent, st, command, consent, h);
         });
     }
@@ -467,7 +503,7 @@ module.exports.deskaudio = function (parent) {
                     // without asking: refuse it where consent is required.
                     if (st.consent && !command.proto) {
                         sendAgent(agent, { pluginaction: 'stop', sid: sid });
-                        endStream(nodeid, 'error', 'agent_outdated', 'На устройстве требуется согласие пользователя, а ядро агента устарело — обновите ядро агента');
+                        endStream(nodeid, 'error', 'agent_outdated', 'This device requires user consent, but its agent core is outdated — update the agent core');
                         break;
                     }
                     st.ready = true;
@@ -493,12 +529,16 @@ module.exports.deskaudio = function (parent) {
             case 'consentresult':
                 var sess = st.pending[command.reqid];
                 if (!sess) return;
+                var wantBar = st.pendingBar[command.reqid];
                 delete st.pending[command.reqid];
+                delete st.pendingBar[command.reqid];
                 if (command.ok) {
                     attach(st, sess);
+                    if (wantBar) st.bar = true;
+                    updateBar(st);
                     sendStatus(sess, nodeid, 'started', '', '', { rate: st.rate });
                 } else {
-                    sendStatus(sess, nodeid, 'error', 'consent_denied', 'Пользователь не разрешил прослушивание');
+                    sendStatus(sess, nodeid, 'error', 'consent_denied', 'The user did not allow listening');
                     if (st.listeners.length === 0 && Object.keys(st.pending).length === 0) removeListener(nodeid, sess);
                 }
                 break;
@@ -535,17 +575,17 @@ module.exports.deskaudio = function (parent) {
     // =====================================================================
 
     // ---- Interface language -------------------------------------------
-    // Russian or English, following MeshCentral's page language (<html lang>),
-    // else the browser's. _t(key, a, b, ...) fills {0}, {1}, ... Server and
-    // agent errors carry a stable code that is translated here (code_<code>);
-    // their Russian text is only the fallback for an unknown code.
+    // Russian for a Russian MeshCentral page (<html lang>, else the browser's
+    // language), English otherwise. _t(key, a, b, ...) fills {0}, {1}, ...
+    // Server and agent errors carry a stable code that is translated here
+    // (code_<code>); their English text is only the fallback for an unknown code.
     obj._t = function (key) {
         var P = (typeof pluginHandler !== 'undefined' && pluginHandler.deskaudio) || {};
         if (!P._langCache) {
             var l = '';
             try { l = (document.documentElement && document.documentElement.lang) || ''; } catch (e) { }
             if (!l) try { l = navigator.language || ''; } catch (e) { }
-            P._langCache = (!l || /^ru|^uk|^be/i.test(l)) ? 'ru' : 'en';
+            P._langCache = /^ru/i.test(l) ? 'ru' : 'en';
         }
         var D = {
             tab: ['Звук', 'Audio'],
@@ -594,6 +634,10 @@ module.exports.deskaudio = function (parent) {
             code_helper_failed: ['Хелпер завершился с ошибкой', 'The capture helper failed'],
             code_helper_corrupt: ['Хелпер пришёл повреждённым', 'The capture helper arrived corrupted'],
             code_helper_start: ['Не удалось запустить хелпер', 'Cannot start the capture helper'],
+            code_helper_exit: ['Хелпер завершил работу', 'The capture helper exited'],
+            code_bar_closed: ['Удалённый пользователь закрыл панель прослушивания', 'The remote user closed the listening bar'],
+            l_deskopt: ['параметры подключения рабочего стола: {0}', 'desktop connection options: {0}'],
+            opt_prompt: ['запрос согласия', 'consent prompt'], opt_bar: ['панель', 'privacy bar'], opt_toast: ['уведомление', 'notification'],
             l_start: ['старт: {0}, кодек «{1}», {2} кГц, буфер {3} мс, {4}', 'start: {0}, codec "{1}", {2} kHz, buffer {3} ms, {4}'],
             l_reconf: ['изменение настроек на лету: кодек «{0}», {1} кГц, {2}', 'live settings change: codec "{0}", {1} kHz, {2}'],
             l_sil_on: ['тишина не передаётся', 'silence not sent'], l_sil_off: ['тишина передаётся', 'silence sent'],
@@ -637,7 +681,11 @@ module.exports.deskaudio = function (parent) {
         // Agents (from 1.1.2) send English diagnostics (paths, HRESULTs, hashes):
         // show them next to the translation. Older agents sent the same text
         // in Russian - that one is just the translation again.
-        return (msg && !/[\u0400-\u04FF]/.test(msg) && msg !== tr) ? tr + ': ' + msg : tr;
+        // The server sends its own statuses with the English translation as the
+        // text: that is not a detail either.
+        var P = pluginHandler.deskaudio, lang = P._langCache, en;
+        P._langCache = 'en'; try { en = T('code_' + m.code); } finally { P._langCache = lang; }
+        return (msg && !/[\u0400-\u04FF]/.test(msg) && msg !== tr && msg !== en) ? tr + ': ' + msg : tr;
     };
 
     obj.onDeviceRefreshEnd = function () {
@@ -838,6 +886,15 @@ module.exports.deskaudio = function (parent) {
             if (st2.active && !st2.gotAudio) { Pt.stop(); st2.statusText = Pt._t('st_no_answer'); Pt.render(); }
         }, 10000);
         var msg = P._params('start');
+        var dc = P._deskConsent(s.nodeid);
+        if (dc) {
+            msg.consent = dc;
+            var o = [];
+            if (dc & 8) o.push(T('opt_prompt'));
+            if (dc & 64) o.push(T('opt_bar'));
+            if (dc & 1) o.push(T('opt_toast'));
+            P.log(T('l_deskopt', o.join(', ')));
+        }
         P.log(T('l_start', currentNode.name || s.nodeid, codec, rate / 1000, Math.round(s.jitter * 1000),
               T(msg.silence ? 'l_sil_on' : 'l_sil_off')) + (codec === 'opus' || codec === 'auto' ? T('l_opus_br', msg.bitrate) : ''));
         s.rxBytes = 0; s.rxMsgs = 0; s.statsAt = Date.now();
@@ -850,6 +907,19 @@ module.exports.deskaudio = function (parent) {
         if (codec === 'opus' || codec === 'adpcm' || codec === 'pcm') send([codec]);
         else P.probeCodecs(send);
         P.render();
+    };
+
+    // Consent options the open desktop session of this device was started with
+    // (Connect menu: "Ask Consent", "Privacy Bar", "Ask Consent + Bar").
+    // MeshCentral keeps them only in that session (desktop.options.consent),
+    // so the request carries them; the server only ever adds them.
+    obj._deskConsent = function (nodeid) {
+        try {
+            if (typeof desktop === 'undefined' || !desktop || !desktop.State || !desktop.options) return 0;
+            if (typeof desktopNode !== 'undefined' && desktopNode && desktopNode._id !== nodeid) return 0;
+            var c = desktop.options.consent;
+            return (typeof c === 'number') ? (c & (1 | 8 | 64)) : 0;
+        } catch (e) { return 0; }
     };
 
     // The stream parameters from the saved settings, as a request to the
