@@ -92,7 +92,20 @@ test("the desktop audio button copies the class of MeshCentral's Actions button"
         assert.ok(b, "button added to the custom UI slot");
         assert.strictEqual(b.className, "btn btn-primary btn-sm me-1", "same look as Actions/Settings");
         assert.strictEqual(b.value, "Звук", "plain label like the other buttons");
-        assert.strictEqual(b.onkeydown(), false, "keys are not swallowed by the button");
+        // Typed characters reach the remote desktop on keypress: the button must
+        // neither take the focus nor cancel keydown (that suppresses keypress).
+        assert.ok(!b.onkeydown && !b.onkeypress, "no key handlers that cancel keydown/keypress");
+        assert.strictEqual(b.tabIndex, -1, "not focusable with Tab");
+        let prevented = false;
+        b.onmousedown({ preventDefault() { prevented = true; } });
+        assert.ok(prevented, "a mouse click does not focus the button");
+        let blurred = false;
+        let toggled = false;
+        b.blur = () => { blurred = true; };
+        obj.toggle = () => { toggled = true; };
+        b.onclick();
+        assert.ok(blurred, "and the focus is dropped after the click anyway");
+        assert.ok(toggled, "the click still toggles listening");
     } finally { Object.keys(saved).forEach((n) => { global[n] = saved[n]; }); }
 });
 

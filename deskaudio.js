@@ -767,9 +767,13 @@ module.exports.deskaudio = function (parent) {
             db.title = T('desk_title');
             if (ref && ref.className) db.className = ref.className;
             db.style.cssText = 'float:left';
-            db.onkeypress = function () { return false; };      // like MeshCentral's buttons: keys go to the desktop
-            db.onkeydown = function () { return false; };
-            db.onclick = function () { pluginHandler.deskaudio.toggle(); };
+            // The button must never hold the keyboard focus: MeshCentral sends
+            // typed characters on keypress, and a focused button whose keydown
+            // is cancelled gets no keypress at all - the remote desktop would
+            // receive only Backspace, arrows and the like until the focus moved.
+            db.tabIndex = -1;
+            db.onmousedown = function (e) { if (e && e.preventDefault) e.preventDefault(); };   // a click does not focus it
+            db.onclick = function () { if (this.blur) this.blur(); pluginHandler.deskaudio.toggle(); };
             slot.appendChild(db);
         }
 
